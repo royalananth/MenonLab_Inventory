@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback, useRef } from "react";
 import * as XLSX from "xlsx";
-import { FlaskConical, Boxes, ClipboardList, BarChart3, Settings, Plus, Search, X, MapPin, ChevronLeft, ChevronRight, Download, Trash2, User, Check, Shield, Lock, RefreshCw, ShoppingCart, AlertTriangle, CheckCircle2, Send, PackageCheck, DollarSign, ClipboardCheck, Calendar, Clock, Bell, ListChecks, Pencil } from "lucide-react";
+import { FlaskConical, Boxes, ClipboardList, BarChart3, Settings, Plus, Search, X, MapPin, ChevronLeft, ChevronRight, Download, Trash2, User, Check, Shield, Lock, RefreshCw, ShoppingCart, AlertTriangle, CheckCircle2, Send, PackageCheck, DollarSign, ClipboardCheck, Calendar, Clock, Bell, ListChecks, Pencil, TrendingDown, FileSpreadsheet, Beaker} from "lucide-react";
 
 /* ---------- theme ---------- */
 const T = { bg: "#F4F6F8", card: "#FFFFFF", ink: "#12151C", muted: "#5B6672", border: "#E2E7EC", accent: "#0E7C86", accentInk: "#0A5A62", amber: "#B45309", danger: "#B42318", line: "#EEF1F4" };
@@ -22,6 +22,18 @@ const Field = ({ label, children }) => (<label style={{ display: "block", margin
 const inpStyle = { width: "100%", boxSizing: "border-box", height: 44, padding: "0 12px", fontSize: 15, color: T.ink, background: "#fff", border: `1px solid ${T.border}`, borderRadius: 10, outline: "none" };
 const Input = (p) => <input {...p} style={{ ...inpStyle, ...(p.style || {}) }} />;
 const UNITS = ["aliquots", "vial", "tube", "µL", "µg", "mg", "mL", "rxn", "kit", "bottle", "plate", "box", "each"];
+const ANTIBODY_CATS = ["Antibodies"];
+const ASSAY_GROUPS = ["", "Western", "Flow", "ICC", "ELISA/Multiplex", "CyTOF", "PCR", "Cell culture"];
+const CLONALITY = ["", "M", "P"];
+
+/* An item is low when it is at or below its par level (reorder threshold),
+   or simply out when no par level has been set. */
+function lowStock(i) {
+  const qty = i.qty === "" || i.qty == null || isNaN(+i.qty) ? null : +i.qty;
+  if (qty === null) return false;
+  const min = i.minQty === "" || i.minQty == null || isNaN(+i.minQty) ? null : +i.minQty;
+  return min !== null ? qty <= min : qty <= 0;
+}
 const UnitInput = (p) => (<><input {...p} list="unit-opts" style={{ ...inpStyle, ...(p.style || {}) }} placeholder={p.placeholder || "unit"} /><datalist id="unit-opts">{UNITS.map((u) => <option key={u} value={u} />)}</datalist></>);
 const Select = ({ children, ...p }) => <select {...p} style={{ ...inpStyle, appearance: "none", ...(p.style || {}) }}>{children}</select>;
 const Btn = ({ kind = "primary", style, ...p }) => { const base = { height: 46, borderRadius: 12, fontSize: 15, fontWeight: 600, border: "1px solid transparent", cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%" }; const kinds = { primary: { background: T.accent, color: "#fff" }, ghost: { background: "#fff", color: T.ink, border: `1px solid ${T.border}` }, danger: { background: "#fff", color: T.danger, border: `1px solid ${T.danger}44` } }; return <button {...p} style={{ ...base, ...kinds[kind], ...style }} />; };
@@ -53,7 +65,9 @@ export default function App() {
   const [instruments, setInstruments] = useState([]);
   const [bookings, setBookings] = useState([]);
   const [notifs, setNotifs] = useState([]);
+  const [mediaPar, setMediaPar] = useState([]);
   const [showNotif, setShowNotif] = useState(false);
+  const [orderSeed, setOrderSeed] = useState(null);
   const [toast, setToast] = useState("");
   const flash = (t) => { setToast(t); setTimeout(() => setToast(""), 1900); };
   const meRef = useRef("");
@@ -65,7 +79,7 @@ export default function App() {
       const d = await r.json();
       setMembers(d.members || []); setCats(d.categories || []); setProjects(d.projects || []);
       setInv(d.items || []); setUsage(d.usage || []); setGrants(d.grants || []); setOrders(d.orders || []);
-      setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []);
+      setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []); setMediaPar(d.mediaPar || []);
     } catch { /* keep last good state */ }
     setSyncing(false); setReady(true);
   }, []);
@@ -106,7 +120,7 @@ export default function App() {
   const updateOrder = (o) => { setOrders((s) => s.map((x) => x.id === o.id ? { ...x, ...o } : x)); post({ type: "order", action: "update", payload: o }); flash("Request updated"); };
   const STMAP = { route: "routed", approve: "approved", place: "ordered", receive: "received", reject: "rejected" };
   const orderAction = (id, action, extra = {}) => {
-    setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "route" ? { authorizer: me, approver: extra.approver } : action === "approve" ? { piApprover: me } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
+    setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "route" ? { authorizer: me, approver: extra.approver } : action === "approve" ? { piApprover: me, frs: extra.frs || o.frs } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
     post({ type: "order", action, payload: { id, by: me, ...extra } });
     if (action === "receive" && extra.addItem) flash("Received → inventory"); else flash("Updated");
   };
@@ -118,16 +132,22 @@ export default function App() {
   const markSeen = (id) => { setNotifs((s) => s.map((n) => n.id === id ? { ...n, seen: true } : n)); post({ type: "notification", action: "seen", payload: { id } }); };
   const markAllSeen = () => { setNotifs((s) => s.map((n) => ({ ...n, seen: true }))); post({ type: "notification", action: "seenAll", payload: { me } }); };
 
+  const setMemberRole = (name, role) => { setMembers((s) => s.map((m) => m.name === name ? { ...m, role } : m)); post({ type: "member", action: "setRole", payload: { name, role } }); };
+
   const memberNames = members.map((m) => m.name);
   const pdNames = members.filter((m) => m.pd).map((m) => m.name);
   const approverNames = members.filter((m) => m.role === "chair" || m.pd).map((m) => m.name);
   const meRec = members.find((m) => m.name === me) || {};
   const role = meRec.role, isPD = meRec.pd, isChair = role === "chair", isFull = role === "admin";
-  const canEdit = isFull || isChair;
-  const caps = { intake: isFull, approve: isChair || isPD, place: isFull, grants: isChair || isPD };
+  // "guest" = collaborators outside the lab (Yoshi, Zheping, the group downstairs)
+  // who Rheanna asked to be able to reserve instruments and nothing else.
+  const isGuest = role === "guest";
+  const canEdit = (isFull || isChair) && !isGuest;
+  const caps = { intake: isFull && !isGuest, approve: (isChair || isPD) && !isGuest, place: isFull && !isGuest, grants: (isChair || isPD) && !isGuest };
   const unseen = notifs.filter((n) => !n.seen).length;
 
   if (!ready) return <div style={{ minHeight: "100vh", background: T.bg, display: "grid", placeItems: "center", color: T.muted, fontFamily: "system-ui" }}>Loading inventory…</div>;
+  const view = isGuest && !["book", "me"].includes(tab) ? "book" : tab;
 
   return (
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", background: T.bg, minHeight: "100vh", color: T.ink }}>
@@ -158,18 +178,21 @@ export default function App() {
           <Btn onClick={() => setTab("me")}>Choose your name</Btn>
         </div>}
 
-        {tab === "log" && <LogTab {...{ me, inv, usage, cats, onLog: logUsage, onUpdateUsage: updateUsage, onDeleteUsage: deleteUsage }} />}
-        {tab === "inv" && <InvTab {...{ inv, cats, projects, pdNames, canEdit, onUpsert: upsertItem, onDelete: deleteItem }} />}
-        {tab === "ord" && <OrdersTab {...{ me, caps, orders, grants, projects, inv, members, approverNames, onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
-        {tab === "book" && <BookTab {...{ me, canEdit, instruments, bookings, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument }} />}
-        {tab === "rep" && <RepTab {...{ usage, memberNames }} />}
-        {tab === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, canEdit, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat }} />}
-        {tab === "me" && <MeTab {...{ me, members, pickMe, setTab }} />}
+        {view === "log" && <LogTab {...{ me, inv, usage, cats, onLog: logUsage, onUpdateUsage: updateUsage, onDeleteUsage: deleteUsage }} />}
+        {view === "inv" && <InvTab {...{ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert: upsertItem, onDelete: deleteItem, onRequest: (seed) => { setOrderSeed(seed); setTab("ord"); } }} />}
+        {view === "ord" && <OrdersTab {...{ me, caps, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
+        {view === "book" && <BookTab {...{ me, canEdit, instruments, bookings, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument }} />}
+        {view === "rep" && <RepTab {...{ usage, memberNames }} />}
+        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat }} />}
+        {view === "me" && <MeTab {...{ me, members, pickMe, setTab }} />}
 
-        <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: "#fff", borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: "repeat(6,1fr)", height: 66, zIndex: 20 }}>
-          {[["log", "Log", ClipboardList], ["inv", "Inventory", Boxes], ["ord", "Orders", ShoppingCart], ["book", "Book", Calendar], ["rep", "Reports", BarChart3], ["set", "Manage", Settings]].map(([k, label, Icon]) => {
+        <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: "#fff", borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: `repeat(${isGuest ? 2 : 6},1fr)`, height: 66, zIndex: 20 }}>
+          {(isGuest
+            ? [["book", "Book", Calendar], ["me", "You", User]]
+            : [["log", "Log", ClipboardList], ["inv", "Inventory", Boxes], ["ord", "Orders", ShoppingCart], ["book", "Book", Calendar], ["rep", "Reports", BarChart3], ["set", "Manage", Settings]]
+          ).map(([k, label, Icon]) => {
             const badge = k === "ord" ? pendingFor(orders, me, caps) : 0;
-            return (<button key={k} onClick={() => setTab(k)} style={{ position: "relative", background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, color: tab === k ? T.accent : T.muted }}>
+            return (<button key={k} onClick={() => setTab(k)} style={{ position: "relative", background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, color: view === k ? T.accent : T.muted }}>
               <Icon size={19} />{badge > 0 && <span style={{ position: "absolute", top: 6, right: "50%", marginRight: -18, background: T.danger, color: "#fff", fontSize: 9.5, fontWeight: 700, borderRadius: 999, minWidth: 15, height: 15, display: "grid", placeItems: "center", padding: "0 3px" }}>{badge}</span>}<span style={{ fontSize: 9.5, fontWeight: 600 }}>{label}</span>
             </button>);
           })}
@@ -251,25 +274,27 @@ function UsageEdit({ u, onSave, onClose }) {
 }
 
 /* ---------- INVENTORY ---------- */
-function InvTab({ inv, cats, projects, pdNames, canEdit, onUpsert, onDelete }) {
+function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, onDelete, onRequest }) {
   const [q, setQ] = useState(""); const [filter, setFilter] = useState("All"); const [edit, setEdit] = useState(null); const [view, setView] = useState(null);
   const filtered = inv.filter((i) => {
-    if (q && !(i.name + " " + i.vendor + " " + i.catalog + " " + i.box).toLowerCase().includes(q.toLowerCase())) return false;
+    if (q && !(i.name + " " + i.vendor + " " + i.catalog + " " + i.box + " " + (i.lot || "") + " " + (i.assayGroup || "") + " " + (i.applications || "") + " " + (i.clone || "")).toLowerCase().includes(q.toLowerCase())) return false;
     if (filter === "General store") return i.scope !== "Project";
     if (filter === "Project kits") return i.scope === "Project";
     if (filter === "Needs info") return incomplete(i);
+    if (filter === "Low stock") return lowStock(i);
     if (cats.includes(filter)) return i.category === filter;
     return true;
   });
-  const narrowed = q || cats.includes(filter) || filter === "Project kits" || filter === "Needs info";
+  const narrowed = q || cats.includes(filter) || filter === "Project kits" || filter === "Needs info" || filter === "Low stock";
   const cap = narrowed ? 100 : 10;
   const groups = cats.map((c) => [c, filtered.filter((i) => i.category === c)]).filter(([, arr]) => arr.length);
   const exportInv = () => {
-    const rows = inv.map((i) => ({ Name: i.name, Category: i.category, Scope: i.scope, Project: i.project, Leader: i.leader, Room: i.room, "Fridge/Location": i.fridge, Box: i.box, Qty: i.qty, Unit: i.unit, "Cat#": i.catalog, Vendor: i.vendor, Notes: i.notes }));
+    const rows = inv.map((i) => ({ Name: i.name, Category: i.category, Assay: i.assayGroup, Scope: i.scope, Project: i.project, Leader: i.leader, Room: i.room, "Fridge/Location": i.fridge, Box: i.box, Qty: i.qty, Unit: i.unit, "Par level": i.minQty, "Cat#": i.catalog, Vendor: i.vendor, "Lot#": i.lot, Host: i.host, Clonality: i.clonality, Clone: i.clone, Isotype: i.isotype, Reactivity: i.reactivity, Applications: i.applications, Owner: i.owner, Received: i.received, Notes: i.notes }));
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Inventory"); XLSX.writeFile(wb, `MenonLab_Inventory_${isoDate(new Date())}.xlsx`);
   };
   const missingCount = inv.filter(incomplete).length;
-  const chips = ["All", "General store", "Project kits", ...(missingCount ? ["Needs info"] : []), ...cats];
+  const low = inv.filter(lowStock);
+  const chips = ["All", ...(low.length ? ["Low stock"] : []), "General store", "Project kits", ...(missingCount ? ["Needs info"] : []), ...cats];
   return (
     <div style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
@@ -281,6 +306,11 @@ function InvTab({ inv, cats, projects, pdNames, canEdit, onUpsert, onDelete }) {
       </div>
       <div style={{ position: "relative", marginBottom: 10 }}><Search size={17} color={T.muted} style={{ position: "absolute", left: 12, top: 14 }} /><Input placeholder="Search name, vendor, cat #, box…" value={q} onChange={(e) => setQ(e.target.value)} style={{ paddingLeft: 38 }} /></div>
       <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 6, marginBottom: 6 }}>{chips.map((c) => (<button key={c} onClick={() => setFilter(c)} style={{ flexShrink: 0, border: `1px solid ${filter === c ? T.accent : T.border}`, background: filter === c ? T.accent : "#fff", color: filter === c ? "#fff" : T.ink, borderRadius: 999, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{c}</button>))}</div>
+      {low.length > 0 && filter !== "Low stock" && (
+        <button onClick={() => setFilter("Low stock")} style={{ width: "100%", display: "flex", alignItems: "center", gap: 9, background: "#FDF0DF", border: `1px solid ${T.amber}33`, borderRadius: 12, padding: "11px 13px", margin: "4px 0 10px", cursor: "pointer", textAlign: "left" }}>
+          <TrendingDown size={17} color={T.amber} style={{ flexShrink: 0 }} />
+          <span style={{ fontSize: 13, color: T.amber, fontWeight: 600 }}>{low.length} item{low.length === 1 ? "" : "s"} at or below par level — tap to review</span>
+        </button>)}
       {!canEdit && <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: T.muted, margin: "4px 0 10px" }}><Lock size={13} />View only — tap an item for details. Editing is limited to program directors.</div>}
       {groups.map(([cat, arr]) => (
         <div key={cat} style={{ marginTop: 16 }}>
@@ -289,25 +319,32 @@ function InvTab({ inv, cats, projects, pdNames, canEdit, onUpsert, onDelete }) {
             <button key={i.id} onClick={() => canEdit ? setEdit(i) : setView(i)} style={{ ...rowBtn, alignItems: "flex-start" }}>
               <div style={{ minWidth: 0, textAlign: "left" }}><div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.name}</div>
                 <div style={{ fontSize: 11.5, color: T.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}><MapPin size={12} />{locLine(i)}{i.scope === "Project" && <span style={{ color: "#127449", fontWeight: 600 }}>· {i.project}</span>}{incomplete(i) && <span style={{ display: "inline-flex", alignItems: "center", gap: 3, color: T.amber, fontWeight: 600 }}><AlertTriangle size={11} />needs info</span>}</div></div>
-              <div style={{ textAlign: "right", flexShrink: 0, paddingLeft: 8 }}>{i.qty !== "" && i.qty != null && <div style={{ fontSize: 13, fontWeight: 700, color: (!isNaN(+i.qty) && +i.qty <= 1 ? T.amber : T.ink) }}>{i.qty}{i.unit ? " " + i.unit : ""}</div>}{i.box && <div style={{ fontSize: 11, color: T.muted, fontFamily: "ui-monospace, Menlo, monospace", marginTop: 2 }}>{i.box}</div>}</div>
+              <div style={{ textAlign: "right", flexShrink: 0, paddingLeft: 8 }}>{i.qty !== "" && i.qty != null && <div style={{ fontSize: 13, fontWeight: 700, color: lowStock(i) ? T.amber : T.ink }}>{i.qty}{i.unit ? " " + i.unit : ""}</div>}{i.minQty ? <div style={{ fontSize: 10.5, color: T.muted, marginTop: 1 }}>par {i.minQty}</div> : null}{i.box && <div style={{ fontSize: 11, color: T.muted, fontFamily: "ui-monospace, Menlo, monospace", marginTop: 2 }}>{i.box}</div>}</div>
             </button>))}
           {arr.length > cap && <div style={{ fontSize: 12, color: T.muted, padding: "4px 2px 2px" }}>+{arr.length - cap} more — search or pick this category to see all.</div>}
         </div>))}
       {filtered.length === 0 && <EmptyNote>No items match.</EmptyNote>}
-      {edit && <ItemForm item={edit.new ? null : edit} cats={cats} projects={projects} pdNames={pdNames} onSave={(it) => { onUpsert(it); setEdit(null); }} onDelete={(id) => { onDelete(id); setEdit(null); }} onClose={() => setEdit(null)} />}
-      {view && <ItemForm item={view} cats={cats} projects={projects} pdNames={pdNames} readOnly onClose={() => setView(null)} />}
+      {edit && <ItemForm item={edit.new ? null : edit} cats={cats} projects={projects} pdNames={pdNames} onRequest={!edit.new && me && !isGuest ? () => { onRequest(edit); setEdit(null); } : null} onSave={(it) => { onUpsert(it); setEdit(null); }} onDelete={(id) => { onDelete(id); setEdit(null); }} onClose={() => setEdit(null)} />}
+      {view && <ItemForm item={view} cats={cats} projects={projects} pdNames={pdNames} readOnly onRequest={me && !isGuest ? () => { onRequest(view); setView(null); } : null} onClose={() => setView(null)} />}
     </div>
   );
 }
 
-function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, onClose }) {
-  const [f, setF] = useState(item || { id: uid(), name: "", category: cats[0], scope: "General", project: "", leader: "", room: "", fridge: "", box: "", catalog: "", vendor: "", qty: "", unit: "", notes: "" });
+function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, onRequest, onClose }) {
+  const [f, setF] = useState(item || { id: uid(), name: "", category: cats[0], scope: "General", project: "", leader: "", room: "", fridge: "", box: "", catalog: "", vendor: "", qty: "", unit: "", notes: "", lot: "", assayGroup: "", host: "", clonality: "", clone: "", isotype: "", reactivity: "", applications: "", owner: "", received: "", minQty: "" });
+  const isAb = ANTIBODY_CATS.includes(f.category);
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const onProject = (name) => { const p = projects.find((x) => x.name === name); setF((s) => ({ ...s, project: name, leader: p && p.leader ? p.leader : s.leader })); };
   const ok = f.name.trim() && (f.scope !== "Project" || f.project);
   if (readOnly) return (<Sheet title={f.name} onClose={onClose}>
-    <Static label="Category" value={f.category} /><Static label="Belongs to" value={f.scope === "Project" ? `${f.project}${f.leader ? " · " + shortName(f.leader) : ""}` : "General inventory"} />
-    <Static label="Location" value={locLine(f)} /><Static label="Quantity" value={f.qty !== "" ? `${f.qty} ${f.unit}` : ""} /><Static label="Catalog #" value={f.catalog} /><Static label="Vendor" value={f.vendor} /><Static label="Notes" value={f.notes} />
+    {lowStock(f) && <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "9px 12px", marginBottom: 14 }}><TrendingDown size={15} />At or below par level{f.minQty ? ` (par ${f.minQty})` : ""} — worth reordering.</div>}
+    <Static label="Category" value={[f.category, f.assayGroup].filter(Boolean).join(" · ")} /><Static label="Belongs to" value={f.scope === "Project" ? `${f.project}${f.leader ? " · " + shortName(f.leader) : ""}` : "General inventory"} />
+    <Static label="Location" value={locLine(f)} /><Static label="Quantity" value={f.qty !== "" ? `${f.qty} ${f.unit}` : ""} /><Static label="Par level" value={f.minQty} />
+    <Static label="Catalog #" value={f.catalog} /><Static label="Vendor" value={f.vendor} /><Static label="Lot #" value={f.lot} />
+    {isAb && <><Static label="Host / clonality" value={[f.host, f.clonality === "M" ? "monoclonal" : f.clonality === "P" ? "polyclonal" : f.clonality].filter(Boolean).join(" · ")} />
+      <Static label="Clone #" value={f.clone} /><Static label="Isotype" value={f.isotype} /><Static label="Reactivity" value={f.reactivity} /><Static label="Validated for" value={f.applications} /></>}
+    <Static label="Kept by" value={f.owner} /><Static label="Received" value={f.received} /><Static label="Notes" value={f.notes} />
+    {onRequest && <div style={{ marginTop: 6 }}><Btn kind="ghost" onClick={onRequest}><ShoppingCart size={16} />Request more of this</Btn></div>}
   </Sheet>);
   return (<Sheet title={item ? "Edit item" : "Add item"} onClose={onClose}>
     <Field label="Reagent name *"><Input value={f.name} onChange={(e) => set("name", e.target.value)} placeholder="e.g. Anti-P-gp (C219)" /></Field>
@@ -317,10 +354,33 @@ function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, o
       <Field label="Program director"><Select value={f.leader} onChange={(e) => set("leader", e.target.value)}><option value="">—</option>{pdNames.map((n) => <option key={n}>{n}</option>)}</Select></Field></>}
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Room"><Input value={f.room} onChange={(e) => set("room", e.target.value)} placeholder="e.g. 132" /></Field><Field label="Fridge / freezer"><Input value={f.fridge} onChange={(e) => set("fridge", e.target.value)} placeholder="e.g. #38, -20C" /></Field></div>
     <Field label="Box / label"><Input value={f.box} onChange={(e) => set("box", e.target.value)} placeholder="e.g. Box 1" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field>
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Quantity"><Input value={f.qty} onChange={(e) => set("qty", e.target.value)} placeholder="e.g. 4" /></Field><Field label="Unit"><UnitInput value={f.unit} onChange={(e) => set("unit", e.target.value)} /></Field></div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+      <Field label="Quantity"><Input value={f.qty} onChange={(e) => set("qty", e.target.value)} placeholder="4" /></Field>
+      <Field label="Unit"><UnitInput value={f.unit} onChange={(e) => set("unit", e.target.value)} /></Field>
+      <Field label="Par level"><Input value={f.minQty || ""} onChange={(e) => set("minQty", e.target.value)} placeholder="2" inputMode="decimal" /></Field>
+    </div>
+    <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>Par level is the reorder threshold. At or below it the item shows as low stock and joins the monthly restocking list.</div>
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Catalog #"><Input value={f.catalog} onChange={(e) => set("catalog", e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field><Field label="Vendor"><Input value={f.vendor} onChange={(e) => set("vendor", e.target.value)} /></Field></div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Lot #"><Input value={f.lot || ""} onChange={(e) => set("lot", e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field><Field label="Kept by"><Input value={f.owner || ""} onChange={(e) => set("owner", e.target.value)} placeholder="e.g. Pilar" /></Field></div>
+    {isAb && (<div style={{ background: "#F8FAFB", border: `1px solid ${T.border}`, borderRadius: 12, padding: 14, marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, fontWeight: 800, marginBottom: 12 }}><Beaker size={15} color={T.accent} />ANTIBODY DETAIL</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Field label="Assay group"><Select value={f.assayGroup || ""} onChange={(e) => set("assayGroup", e.target.value)}>{ASSAY_GROUPS.map((g) => <option key={g || "none"} value={g}>{g || "—"}</option>)}</Select></Field>
+        <Field label="Host species"><Input value={f.host || ""} onChange={(e) => set("host", e.target.value)} placeholder="Rabbit" /></Field>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Field label="Mono / poly"><Select value={f.clonality || ""} onChange={(e) => set("clonality", e.target.value)}>{CLONALITY.map((c) => <option key={c || "none"} value={c}>{c === "M" ? "Monoclonal" : c === "P" ? "Polyclonal" : "—"}</option>)}</Select></Field>
+        <Field label="Clone #"><Input value={f.clone || ""} onChange={(e) => set("clone", e.target.value)} placeholder="EP155Y" /></Field>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Field label="Isotype"><Input value={f.isotype || ""} onChange={(e) => set("isotype", e.target.value)} placeholder="IgG" /></Field>
+        <Field label="Reactivity"><Input value={f.reactivity || ""} onChange={(e) => set("reactivity", e.target.value)} placeholder="Human, Mouse" /></Field>
+      </div>
+      <Field label="Validated for"><Input value={f.applications || ""} onChange={(e) => set("applications", e.target.value)} placeholder="WB, IHC-P, ICC/IF" /></Field>
+    </div>)}
     <Field label="Notes"><Input value={f.notes} onChange={(e) => set("notes", e.target.value)} /></Field>
     <Btn onClick={() => ok && onSave(f)} style={{ opacity: ok ? 1 : .5 }}>{item ? "Save changes" : "Add to inventory"}</Btn>
+    {onRequest && <div style={{ marginTop: 10 }}><Btn kind="ghost" onClick={onRequest}><ShoppingCart size={16} />Request more of this</Btn></div>}
     {item && <div style={{ marginTop: 10 }}><Btn kind="danger" onClick={() => { if (window.confirm(`Delete "${f.name}" from inventory?\n\nThis removes the item itself. It does NOT touch anyone's usage records.`)) onDelete(item.id); }}><Trash2 size={16} />Delete item</Btn></div>}
   </Sheet>);
 }
@@ -370,8 +430,8 @@ function RepTab({ usage, memberNames }) {
 }
 
 /* ---------- MANAGE ---------- */
-function SetTab({ members, cats, projects, pdNames, inv, usage, canEdit, onAddMember, onDelMember, onToggleAdmin, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat }) {
-  const [nm, setNm] = useState(""); const [nmEmail, setNmEmail] = useState(""); const [nmAdmin, setNmAdmin] = useState(false);
+function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, onAddMember, onDelMember, onToggleAdmin, onSetRole, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat }) {
+  const [nm, setNm] = useState(""); const [nmEmail, setNmEmail] = useState(""); const [nmRole, setNmRole] = useState("member");
   const [pn, setPn] = useState(""); const [pl, setPl] = useState(pdNames[0] || ""); const [nc, setNc] = useState(""); const [editP, setEditP] = useState(null);
   if (!canEdit) return (<div style={{ padding: 18 }}>
     <SectionTitle icon={Settings}>Manage</SectionTitle>
@@ -385,12 +445,25 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, canEdit, onAddMe
         <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 12 }}>{members.map((m) => (
           <div key={m.name} style={rowFlat}>
             <div style={{ minWidth: 0 }}><div style={{ fontSize: 14, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>{m.email && <div style={{ fontSize: 11, color: T.muted }}>{m.email}</div>}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}><button onClick={() => onToggleAdmin(m.name)} style={{ fontSize: 10.5, fontWeight: 700, border: `1px solid ${m.role === "admin" ? T.accent : T.border}`, color: m.role === "admin" ? T.accent : T.muted, background: m.role === "admin" ? "#E6F3F4" : "#fff", borderRadius: 999, padding: "3px 8px", cursor: "pointer" }}>{m.pd ? "PD" : m.role === "admin" ? "FULL" : "LOG"}</button>{!m.pd && <button onClick={() => onDelMember(m.name)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+              {m.pd || m.role === "chair"
+                ? <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent, border: `1px solid ${T.accent}`, background: "#E6F3F4", borderRadius: 999, padding: "3px 8px" }}>{m.role === "chair" ? "CHAIR" : "PD"}</span>
+                : <Select value={m.role || "member"} onChange={(e) => onSetRole(m.name, e.target.value)} style={{ height: 32, fontSize: 11.5, fontWeight: 700, padding: "0 8px", width: 122 }}>
+                    <option value="member">Log &amp; view</option>
+                    <option value="admin">Full access</option>
+                    <option value="guest">Booking only</option>
+                  </Select>}
+              {!m.pd && <button onClick={() => onDelMember(m.name)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>}</div>
           </div>))}</div>
         <Field label="Add member — name"><Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="Last, First" /></Field>
         <Field label="Email"><Input value={nmEmail} onChange={(e) => setNmEmail(e.target.value)} placeholder="netid@utmb.edu" /></Field>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, fontSize: 13.5, cursor: "pointer" }}><input type="checkbox" checked={nmAdmin} onChange={(e) => setNmAdmin(e.target.checked)} style={{ width: 18, height: 18 }} />Full (edit) access</label>
-        <Btn onClick={() => { if (nm.trim()) { onAddMember({ name: nm.trim(), email: nmEmail.trim(), role: nmAdmin ? "admin" : "member" }); setNm(""); setNmEmail(""); setNmAdmin(false); } }} style={{ opacity: nm.trim() ? 1 : .5 }}>Add member</Btn>
+        <Field label="Access"><Select value={nmRole} onChange={(e) => setNmRole(e.target.value)}>
+          <option value="member">Log &amp; view — lab member</option>
+          <option value="admin">Full access — edit inventory, take in and place orders</option>
+          <option value="guest">Booking only — outside collaborator</option>
+        </Select></Field>
+        <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 12, lineHeight: 1.5 }}>Booking-only is for people outside the lab who need instrument time (for example the group using the ultracentrifuge). They see the Book tab and nothing else.</div>
+        <Btn onClick={() => { if (nm.trim()) { onAddMember({ name: nm.trim(), email: nmEmail.trim(), role: nmRole }); setNm(""); setNmEmail(""); setNmRole("member"); } }} style={{ opacity: nm.trim() ? 1 : .5 }}>Add member</Btn>
       </Card>
       <Card title={`Projects & leaders · ${projects.length}`}>
         <div style={{ fontSize: 12, color: T.muted, marginBottom: 10 }}>Project kits are stored with — and accountable to — their program director.</div>
@@ -404,8 +477,20 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, canEdit, onAddMe
         <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 12 }}>{cats.map((c) => (<span key={c} style={{ display: "flex", alignItems: "center", gap: 6, border: `1px solid ${T.border}`, borderRadius: 999, padding: "5px 6px 5px 11px", fontSize: 12.5, fontWeight: 600 }}><span style={{ width: 8, height: 8, borderRadius: 999, background: catColor(c, cats) }} />{c}<button onClick={() => onDelCat(c)} style={{ ...iconBtn, padding: 2 }}><X size={13} color={T.muted} /></button></span>))}</div>
         <div style={{ display: "flex", gap: 8 }}><Input value={nc} onChange={(e) => setNc(e.target.value)} placeholder="Add category (e.g. Flow antibody)" /><button onClick={() => { if (nc.trim()) { onAddCat(nc.trim()); setNc(""); } }} style={addBtn}><Plus size={18} /></button></div>
       </Card>
+      <Card title={`Media par levels · ${(mediaPar || []).length}`}>
+        <div style={{ fontSize: 12, color: T.muted, marginBottom: 10, lineHeight: 1.5 }}>The standing media order, by cell type. These feed the media page of the monthly restocking report. Per-item reorder thresholds are set on each item under Inventory.</div>
+        {(mediaPar || []).length === 0 ? <EmptyNote>No par levels loaded.</EmptyNote> : [...new Set(mediaPar.map((p) => p.cellType))].map((ct) => (
+          <div key={ct} style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 800, letterSpacing: ".04em", color: T.accent, marginBottom: 6 }}>{(ct || "OTHER").toUpperCase()}</div>
+            {mediaPar.filter((p) => p.cellType === ct).map((p) => (
+              <div key={p.id} style={{ ...rowFlat, marginBottom: 6 }}>
+                <div style={{ minWidth: 0 }}><div style={{ fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div><div style={{ fontSize: 11, color: T.muted }}>{[p.vendor, p.catalog].filter(Boolean).join(" · ")}</div></div>
+                <div style={{ fontSize: 12, color: T.muted, textAlign: "right", flexShrink: 0 }}>{p.targetQty}{p.perStock ? <div style={{ fontSize: 10.5 }}>{p.perStock}</div> : null}</div>
+              </div>))}
+          </div>))}
+      </Card>
       <Card title="Overview">
-        <div style={{ display: "flex", gap: 10 }}>{[["Items", inv.length], ["Members", members.length], ["Log entries", usage.length]].map(([l, n]) => (<div key={l} style={{ flex: 1, background: "#fff", border: `1px solid ${T.line}`, borderRadius: 10, padding: "12px 10px", textAlign: "center" }}><div style={{ fontSize: 22, fontWeight: 800, color: T.accent }}>{n}</div><div style={{ fontSize: 11.5, color: T.muted, marginTop: 2 }}>{l}</div></div>))}</div>
+        <div style={{ display: "flex", gap: 10 }}>{[["Items", inv.length], ["Low stock", inv.filter(lowStock).length], ["Members", members.length], ["Log entries", usage.length]].map(([l, n]) => (<div key={l} style={{ flex: 1, background: "#fff", border: `1px solid ${T.line}`, borderRadius: 10, padding: "12px 6px", textAlign: "center" }}><div style={{ fontSize: 20, fontWeight: 800, color: l === "Low stock" && n > 0 ? T.amber : T.accent }}>{n}</div><div style={{ fontSize: 10.5, color: T.muted, marginTop: 2 }}>{l}</div></div>))}</div>
       </Card>
     </div>
   );
@@ -418,15 +503,16 @@ function MeTab({ me, members, pickMe, setTab }) {
   const chair = list.filter((m) => m.role === "chair");
   const pds = list.filter((m) => m.pd);
   const full = list.filter((m) => m.role === "admin" && !m.pd);
-  const rest = list.filter((m) => !["chair", "admin"].includes(m.role) && !m.pd);
-  const badgeOf = (m) => m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : null;
+  const rest = list.filter((m) => !["chair", "admin", "guest"].includes(m.role) && !m.pd);
+  const guests = list.filter((m) => m.role === "guest");
+  const badgeOf = (m) => m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : m.role === "guest" ? "BOOK" : null;
   const Row = (m) => (<button key={m.name} onClick={() => { pickMe(m.name); setTab("log"); }} style={{ ...rowFlat, cursor: "pointer", border: `1px solid ${me === m.name ? T.accent : T.border}`, background: me === m.name ? "#E6F3F4" : "#fff", marginBottom: 7 }}><span style={{ fontSize: 14.5, fontWeight: 600 }}>{m.name}</span>{me === m.name ? <Check size={18} color={T.accent} /> : badgeOf(m) ? <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent }}>{badgeOf(m)}</span> : null}</button>);
   const Group = (title, arr) => arr.length ? <div style={{ marginBottom: 14 }}><div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, letterSpacing: ".04em", marginBottom: 8 }}>{title}</div>{arr.map(Row)}</div> : null;
   return (<div style={{ padding: 18 }}>
     <SectionTitle icon={User}>Your identity</SectionTitle>
     <div style={{ fontSize: 13, color: T.muted, marginBottom: 12 }}>Usage you log is attributed to this name.</div>
     <div style={{ position: "relative", marginBottom: 14 }}><Search size={17} color={T.muted} style={{ position: "absolute", left: 12, top: 14 }} /><Input placeholder="Find your name…" value={q} onChange={(e) => setQ(e.target.value)} style={{ paddingLeft: 38 }} /></div>
-    {Group("CHAIR", chair)}{Group("PROGRAM DIRECTORS", pds)}{Group("FULL ACCESS", full)}{Group("LAB MEMBERS", rest)}
+    {Group("CHAIR", chair)}{Group("PROGRAM DIRECTORS", pds)}{Group("FULL ACCESS", full)}{Group("LAB MEMBERS", rest)}{Group("BOOKING ONLY", guests)}
     {list.length === 0 && <EmptyNote>No name matches "{q}".</EmptyNote>}
   </div>);
 }
@@ -454,8 +540,9 @@ function pendingFor(orders, me, caps) {
 }
 const committedFor = (orders, gid) => orders.filter((o) => o.grantId === gid && (o.status === "ordered" || o.status === "received")).reduce((s, o) => s + (Number(o.total) || 0), 0);
 
-function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverNames, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
+function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
   const [nw, setNw] = useState(false);
+  useEffect(() => { if (orderSeed) setNw(true); }, [orderSeed]);
   const [editO, setEditO] = useState(null);
   const [view, setView] = useState("act");
   const [receiving, setReceiving] = useState(null);
@@ -471,6 +558,9 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
     const rows = orders.filter((o) => o.status === "approved").map((o) => ({ Item: o.itemName, "Cat#": o.catalog, Vendor: o.vendor, Qty: o.qty, "Unit $": o.unitPrice, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, "Approved by": o.piApprover, Reason: o.experiment }));
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ Item: "— nothing ready to order —" }]), "To order"); XLSX.writeFile(wb, `MenonLab_ToOrder_${isoDate(new Date())}.xlsx`);
   };
+  // The full monthly pack (supply list, restocking, spend, fund availability)
+  // is generated server-side so it can also be bookmarked or scheduled.
+  const monthlyPack = () => { window.location.href = "/api/monthly"; };
   const exportMonthly = () => {
     const now = new Date(), m0 = new Date(now.getFullYear(), now.getMonth(), 1);
     const rows = orders.filter((o) => new Date(o.createdAt) >= m0).map((o) => ({ Date: fmtDate(o.createdAt), Item: o.itemName, Qty: o.qty, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, Status: (ORDER_STATUS[o.status] || [o.status])[0], Reason: o.experiment }));
@@ -504,6 +594,13 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
       )}
       {caps.grants && <button onClick={() => setShowGrants((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />{showGrants ? "Hide grant setup" : "Manage grants & budgets"}</button>}
       {showGrants && caps.grants && <GrantsPanel grants={grants} onUpsert={onUpsertGrant} onDel={onDelGrant} />}
+      {caps.grants && <SpendPanel orders={orders} grants={grants} />}
+      {(caps.place || caps.grants) && (
+        <div style={{ marginBottom: 14 }}>
+          <Btn onClick={monthlyPack}><FileSpreadsheet size={16} />Monthly pack — supplies, restocking, spend, funds</Btn>
+          <div style={{ fontSize: 11.5, color: T.muted, marginTop: 6, lineHeight: 1.5 }}>Seven tabs: fund availability by grant, restocking list, media par levels, orders, spend by person, usage, and the full supply inventory.</div>
+        </div>
+      )}
 
       {anyRole && <div style={{ display: "flex", gap: 7, marginBottom: 12 }}>
         {[["act", "Needs action", toAct.length], ["mine", "My requests", mine.length], ["all", "All", orders.length]].map(([k, label, n]) => (
@@ -522,7 +619,7 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
       {shown.length === 0 ? <EmptyNote>{view === "act" ? "Nothing needs your action right now." : view === "mine" ? "You haven't requested anything yet." : "No orders yet."}</EmptyNote>
         : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onRoute={() => setRouting(o)} onEdit={() => setEditO(o)} />)}
 
-      {nw && <OrderForm me={me} projects={projects} grants={grants} inv={inv} onSave={(o) => { onCreate(o); setNw(false); }} onClose={() => setNw(false)} />}
+      {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} grants={grants} inv={inv} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
       {editO && <OrderForm me={me} projects={projects} grants={grants} inv={inv} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
       {routing && <RouteSheet o={routing} approvers={approverNames} onConfirm={(approver) => { onAction(routing.id, "route", { approver }); setRouting(null); }} onClose={() => setRouting(null)} />}
       {receiving && <ReceiveSheet o={receiving} onConfirm={(addItem) => { onAction(receiving.id, "receive", { addItem }); setReceiving(null); }} onClose={() => setReceiving(null)} />}
@@ -538,6 +635,14 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
   const insufficient = grant && grant.budget > 0 && remaining < o.total;
   const reject = () => { const r = window.prompt("Reason for sending back?") || ""; onAction(o.id, "reject", { reason: r }); };
   const place = () => { const po = window.prompt("PO / order reference (optional):") || ""; onAction(o.id, "place", { po }); };
+  // Dr. Menon's rule: the FRS is assigned at the moment of final approval,
+  // together with the fund position the approver was looking at.
+  const approveWithFrs = () => {
+    const frs = window.prompt(`FRS / account to charge${grant ? " for " + grant.name : ""}:`, o.frs || "");
+    if (frs === null) return;
+    const fundNote = grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "";
+    onAction(o.id, "approve", { frs: frs.trim(), fundNote });
+  };
   return (
     <div style={{ background: "#fff", border: `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
@@ -550,6 +655,7 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
         {o.grantName && <span>· {o.grantName}</span>}{o.project && <span>· {o.project}</span>}<span>· {shortName(o.requester || "")}</span>
       </div>
       {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
+      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.piApprover ? ` · assigned by ${shortName(o.piApprover)}` : ""}</div>}
       {o.explored && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}><b style={{ color: T.ink, fontWeight: 600 }}>Explored:</b> {o.explored}</div>}
       {o.checklist && Object.keys(o.checklist).length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#127449", background: "#EAF6EE", borderRadius: 8, padding: "5px 9px", marginTop: 8, width: "fit-content" }}>
@@ -566,7 +672,7 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
           <ActBtn onClick={onRoute} icon={Send}>Route for approval</ActBtn>
           <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
         {o.status === "routed" && caps.approve && <>
-          <ActBtn onClick={() => onAction(o.id, "approve")} icon={CheckCircle2}>Final approve</ActBtn>
+          <ActBtn onClick={approveWithFrs} icon={CheckCircle2}>Approve + assign FRS</ActBtn>
           <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
         {o.status === "approved" && caps.place && <ActBtn onClick={place} icon={ShoppingCart}>Place order</ActBtn>}
         {o.status === "ordered" && caps.place && <ActBtn onClick={onReceive} icon={PackageCheck}>Mark received</ActBtn>}
@@ -588,9 +694,9 @@ const CHECKLIST = [
   ["price", "I compared vendor pricing or have a quote"],
 ];
 
-function OrderForm({ me, projects, grants, inv, existing, onSave, onClose }) {
+function OrderForm({ me, projects, grants, inv, existing, seed, onSave, onClose }) {
   const isEdit = !!existing;
-  const [f, setF] = useState(existing ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", grantId: existing.grantId || "", grantName: existing.grantName || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "" } : { id: uid(), itemName: "", catalog: "", vendor: "", qty: "1", unitPrice: "", project: "", grantId: "", grantName: "", experiment: "", notes: "", dupAck: false, explored: "" });
+  const [f, setF] = useState(existing ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", grantId: existing.grantId || "", grantName: existing.grantName || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "" } : { id: uid(), itemName: seed ? seed.name : "", catalog: seed ? seed.catalog || "" : "", vendor: seed ? seed.vendor || "" : "", qty: "1", unitPrice: "", project: seed && seed.scope === "Project" ? seed.project : "", grantId: "", grantName: "", experiment: "", notes: "", dupAck: !!seed, explored: seed ? `Raised from the inventory record: ${seed.qty !== "" && seed.qty != null ? seed.qty + " " + (seed.unit || "") : "no quantity recorded"} at ${locLine(seed)}.` : "", fromItemId: seed ? seed.id : "" });
   const [ck, setCk] = useState({});
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const toggle = (k) => setCk((s) => ({ ...s, [k]: !s[k] }));
@@ -600,8 +706,11 @@ function OrderForm({ me, projects, grants, inv, existing, onSave, onClose }) {
   const ckCount = CHECKLIST.filter((c) => ck[c[0]]).length;
   const ok = f.itemName.trim() && f.experiment.trim() && ckDone && (!dup || f.dupAck);
   const submit = () => { if (!ok) return; const g = grants.find((x) => x.id === f.grantId); onSave({ ...f, total, unitPrice: parseFloat(f.unitPrice) || 0, grantName: g ? g.name : "", ...(isEdit ? {} : { checklist: ck }) }); };
+  const seedGrant = grants.find((x) => x.id === f.grantId);
   return (
     <Sheet title={isEdit ? "Edit request" : "Request an order"} onClose={onClose}>
+      {seed && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.accentInk, background: "#E6F3F4", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
+        <Boxes size={16} style={{ flexShrink: 0, marginTop: 1 }} /><div>Requested from inventory: <b>{seed.name}</b> — {seed.qty !== "" && seed.qty != null ? `${seed.qty} ${seed.unit || ""} on hand` : "no quantity recorded"} at {locLine(seed)}. Received stock tops this record back up.</div></div>}
       <Field label="Item / reagent *"><Input value={f.itemName} onChange={(e) => set("itemName", e.target.value)} placeholder="e.g. Anti-BCRP (BXP-21)" /></Field>
       {dup && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
         <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} /><div>Possibly already in the lab: <b>{dup.name}</b> ({dup.qty || "in stock"}, {locLine(dup)}). <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, cursor: "pointer" }}><input type="checkbox" checked={f.dupAck} onChange={(e) => set("dupAck", e.target.checked)} />I checked — still need to order.</label></div></div>}
@@ -683,6 +792,39 @@ function ReceiveSheet({ o, onConfirm, onClose }) {
     <label style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 14, marginBottom: 16, cursor: "pointer" }}><input type="checkbox" checked={add} onChange={(e) => setAdd(e.target.checked)} style={{ width: 18, height: 18 }} />Add this to inventory now</label>
     <Btn onClick={() => onConfirm(add)}><PackageCheck size={16} />Confirm received</Btn>
   </Sheet>);
+}
+
+/* Who is ordering, who is spending, and against which grant — the accountability
+   view Dr. Menon asked for, on screen rather than only in an export. */
+function SpendPanel({ orders, grants }) {
+  const [open, setOpen] = useState(false);
+  const counted = orders.filter((o) => ["approved", "ordered", "received"].includes(o.status));
+  const people = [...new Set(counted.map((o) => o.requester).filter(Boolean))]
+    .map((p) => ({ person: p, n: counted.filter((o) => o.requester === p).length, total: counted.filter((o) => o.requester === p).reduce((s, o) => s + (Number(o.total) || 0), 0) }))
+    .sort((a, b) => b.total - a.total);
+  const grandTotal = people.reduce((s, p) => s + p.total, 0);
+  if (!counted.length) return null;
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+      <button onClick={() => setOpen((v) => !v)} style={{ width: "100%", background: "none", border: "none", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 800 }}><DollarSign size={15} color={T.accent} />Spend &amp; accountability</span>
+        <span style={{ fontSize: 13, fontWeight: 800, color: T.accent }}>{money(grandTotal)}</span>
+      </button>
+      {open && (<div style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, letterSpacing: ".04em", marginBottom: 8 }}>BY PERSON</div>
+        {people.map((p) => (<div key={p.person} style={{ ...rowFlat, marginBottom: 7 }}>
+          <div style={{ minWidth: 0 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{shortName(p.person)}</div><div style={{ fontSize: 11.5, color: T.muted }}>{p.n} order{p.n === 1 ? "" : "s"}</div></div>
+          <div style={{ fontSize: 14, fontWeight: 700, flexShrink: 0 }}>{money(p.total)}</div></div>))}
+        <div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, letterSpacing: ".04em", margin: "16px 0 8px" }}>BY GRANT</div>
+        {grants.map((g) => { const spent = counted.filter((o) => o.grantId === g.id).reduce((s, o) => s + (Number(o.total) || 0), 0); const rem = (g.budget || 0) - spent; return (
+          <div key={g.id} style={{ ...rowFlat, marginBottom: 7 }}>
+            <div style={{ minWidth: 0 }}><div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</div><div style={{ fontSize: 11.5, color: T.muted }}>{money(spent)} committed</div></div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: g.budget && rem <= 0 ? T.danger : T.ink, flexShrink: 0 }}>{g.budget ? money(rem) : "—"}</div>
+          </div>); })}
+        {grants.length === 0 && <div style={{ fontSize: 12.5, color: T.muted }}>No grants set up yet.</div>}
+      </div>)}
+    </div>
+  );
 }
 
 function GrantsPanel({ grants, onUpsert, onDel }) {
