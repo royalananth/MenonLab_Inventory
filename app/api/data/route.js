@@ -12,7 +12,7 @@ const mapItem = (r) => ({
   owner: r.owner || "", received: r.received_date || "", minQty: r.min_qty || "",
 });
 const mapUsage = (r) => ({ id: r.id, member: r.member, itemId: r.item_id, itemName: r.item_name, category: r.category, qty: r.qty, unit: r.unit, project: r.project, experiment: r.experiment, room: r.room, fridge: r.fridge, box: r.box, notes: r.notes, date: r.ts });
-const mapOrder = (r) => ({ id: r.id, itemName: r.item_name, catalog: r.catalog, vendor: r.vendor, qty: r.qty, unitPrice: Number(r.unit_price) || 0, total: Number(r.total) || 0, project: r.project, grantId: r.grant_id, grantName: r.grant_name, experiment: r.experiment, notes: r.notes, requester: r.requester, status: r.status, dupAck: r.dup_ack, authorizer: r.authorizer, approver: r.approver, piApprover: r.pi_approver, piApprovedAt: r.pi_approved_at, purchaser: r.purchaser, po: r.po, orderedAt: r.ordered_at, receivedAt: r.received_at, rejectReason: r.reject_reason, createdAt: r.created_at, checklist: r.checklist ? JSON.parse(r.checklist) : null, explored: r.explored, frs: r.frs || "", fundNote: r.fund_note || "", fromItemId: r.from_item_id || "" });
+const mapOrder = (r) => ({ id: r.id, itemName: r.item_name, catalog: r.catalog, vendor: r.vendor, qty: r.qty, unitPrice: Number(r.unit_price) || 0, total: Number(r.total) || 0, project: r.project, grantId: r.grant_id, grantName: r.grant_name, experiment: r.experiment, notes: r.notes, requester: r.requester, status: r.status, dupAck: r.dup_ack, authorizer: r.authorizer, approver: r.approver, piApprover: r.pi_approver, piApprovedAt: r.pi_approved_at, purchaser: r.purchaser, po: r.po, orderedAt: r.ordered_at, receivedAt: r.received_at, rejectReason: r.reject_reason, createdAt: r.created_at, checklist: r.checklist ? JSON.parse(r.checklist) : null, explored: r.explored, frs: r.frs || "", fundNote: r.fund_note || "", fromItemId: r.from_item_id || "", requestedApprover: r.requested_approver || "" });
 
 const nid = () => "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 async function notify(recipients, kind, title, body, orderId) {
@@ -22,7 +22,12 @@ async function notify(recipients, kind, title, body, orderId) {
       [nid(), r, kind, title, body, orderId || null]);
   }
 }
-async function intakeNames() { return (await q(`SELECT name FROM members WHERE role='admin'`)).rows.map((r) => r.name); }
+// Orders land on the purchasing desk (Megan). Full-access staff are included
+// as a fallback so the queue is never stuck when she is away.
+async function intakeNames() {
+  const r = await q(`SELECT name FROM members WHERE role IN ('purchasing','admin') ORDER BY (role='purchasing') DESC`);
+  return r.rows.map((x) => x.name);
+}
 const short = (n) => (n || "").includes(",") ? n.split(",")[0].trim() : (n || "").split(" ")[0];
 
 // stock += (restoreQty - newQty), only when the item and both quantities are numeric
@@ -142,14 +147,15 @@ export async function POST(req) {
     } else if (type === "order") {
       const p = payload;
       if (action === "create") {
-        await q(`INSERT INTO orders (id,item_name,catalog,vendor,qty,unit_price,total,project,grant_id,grant_name,experiment,notes,requester,status,dup_ack,checklist,explored,from_item_id,created_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'requested',$14,$15,$16,$17,now())`,
-          [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.grantId || "", p.grantName || "", p.experiment || "", p.notes || "", p.requester, !!p.dupAck, JSON.stringify(p.checklist || {}), p.explored || "", p.fromItemId || ""]);
+        await q(`INSERT INTO orders (id,item_name,catalog,vendor,qty,unit_price,total,project,grant_id,grant_name,experiment,notes,requester,status,dup_ack,checklist,explored,from_item_id,requested_approver,created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'requested',$14,$15,$16,$17,$18,now())`,
+          [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.grantId || "", p.grantName || "", p.experiment || "", p.notes || "", p.requester, !!p.dupAck, JSON.stringify(p.checklist || {}), p.explored || "", p.fromItemId || "", p.requestedApprover || ""]);
         await notify(await intakeNames(), "order", "New order request",
-          `${short(p.requester)} requested ${p.itemName} — needs review & routing.`, p.id);
+          `${short(p.requester)} requested ${p.itemName}`
+          + (p.requestedApprover ? ` — for ${short(p.requestedApprover)} to approve. Please route.` : " — needs review & routing."), p.id);
       } else if (action === "update") {
-        await q(`UPDATE orders SET item_name=$2,catalog=$3,vendor=$4,qty=$5,unit_price=$6,total=$7,project=$8,grant_id=$9,grant_name=$10,experiment=$11,notes=$12,explored=$13 WHERE id=$1 AND status='requested'`,
-          [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.grantId || "", p.grantName || "", p.experiment || "", p.notes || "", p.explored || ""]);
+        await q(`UPDATE orders SET item_name=$2,catalog=$3,vendor=$4,qty=$5,unit_price=$6,total=$7,project=$8,grant_id=$9,grant_name=$10,experiment=$11,notes=$12,explored=$13,requested_approver=$14 WHERE id=$1 AND status='requested'`,
+          [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.grantId || "", p.grantName || "", p.experiment || "", p.notes || "", p.explored || "", p.requestedApprover || ""]);
       } else if (action === "route") {
         await q(`UPDATE orders SET status='routed', authorizer=$2, approver=$3 WHERE id=$1 AND status='requested'`, [p.id, p.by, p.approver || ""]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
