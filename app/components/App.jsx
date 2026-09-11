@@ -143,7 +143,15 @@ export default function App() {
   // who Rheanna asked to be able to reserve instruments and nothing else.
   const isGuest = role === "guest";
   const canEdit = (isFull || isChair) && !isGuest;
-  const caps = { intake: isFull && !isGuest, approve: (isChair || isPD) && !isGuest, place: isFull && !isGuest, grants: (isChair || isPD) && !isGuest };
+  // Dr. Menon, 10 Sep 2026: requests go to Megan (purchasing), who routes them
+  // to the named PI for FRS / grant. Full-access staff keep intake as a fallback.
+  const isPurchasing = role === "purchasing";
+  const caps = {
+    intake: (isFull || isPurchasing) && !isGuest,
+    approve: (isChair || isPD) && !isGuest,
+    place: (isFull || isPurchasing) && !isGuest,
+    grants: (isChair || isPD) && !isGuest,
+  };
   const unseen = notifs.filter((n) => !n.seen).length;
 
   if (!ready) return <div style={{ minHeight: "100vh", background: T.bg, display: "grid", placeItems: "center", color: T.muted, fontFamily: "system-ui" }}>Loading inventory…</div>;
@@ -451,6 +459,7 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdi
                 : <Select value={m.role || "member"} onChange={(e) => onSetRole(m.name, e.target.value)} style={{ height: 32, fontSize: 11.5, fontWeight: 700, padding: "0 8px", width: 122 }}>
                     <option value="member">Log &amp; view</option>
                     <option value="admin">Full access</option>
+                    <option value="purchasing">Purchasing (Megan)</option>
                     <option value="guest">Booking only</option>
                   </Select>}
               {!m.pd && <button onClick={() => onDelMember(m.name)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>}</div>
@@ -460,6 +469,7 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdi
         <Field label="Access"><Select value={nmRole} onChange={(e) => setNmRole(e.target.value)}>
           <option value="member">Log &amp; view — lab member</option>
           <option value="admin">Full access — edit inventory, take in and place orders</option>
+          <option value="purchasing">Purchasing — receives requests and routes them to a PI</option>
           <option value="guest">Booking only — outside collaborator</option>
         </Select></Field>
         <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 12, lineHeight: 1.5 }}>Booking-only is for people outside the lab who need instrument time (for example the group using the ultracentrifuge). They see the Book tab and nothing else.</div>
@@ -503,16 +513,17 @@ function MeTab({ me, members, pickMe, setTab }) {
   const chair = list.filter((m) => m.role === "chair");
   const pds = list.filter((m) => m.pd);
   const full = list.filter((m) => m.role === "admin" && !m.pd);
-  const rest = list.filter((m) => !["chair", "admin", "guest"].includes(m.role) && !m.pd);
+  const purch = list.filter((m) => m.role === "purchasing");
+  const rest = list.filter((m) => !["chair", "admin", "guest", "purchasing"].includes(m.role) && !m.pd);
   const guests = list.filter((m) => m.role === "guest");
-  const badgeOf = (m) => m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : m.role === "guest" ? "BOOK" : null;
+  const badgeOf = (m) => m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : m.role === "purchasing" ? "BUY" : m.role === "guest" ? "BOOK" : null;
   const Row = (m) => (<button key={m.name} onClick={() => { pickMe(m.name); setTab("log"); }} style={{ ...rowFlat, cursor: "pointer", border: `1px solid ${me === m.name ? T.accent : T.border}`, background: me === m.name ? "#E6F3F4" : "#fff", marginBottom: 7 }}><span style={{ fontSize: 14.5, fontWeight: 600 }}>{m.name}</span>{me === m.name ? <Check size={18} color={T.accent} /> : badgeOf(m) ? <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent }}>{badgeOf(m)}</span> : null}</button>);
   const Group = (title, arr) => arr.length ? <div style={{ marginBottom: 14 }}><div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, letterSpacing: ".04em", marginBottom: 8 }}>{title}</div>{arr.map(Row)}</div> : null;
   return (<div style={{ padding: 18 }}>
     <SectionTitle icon={User}>Your identity</SectionTitle>
     <div style={{ fontSize: 13, color: T.muted, marginBottom: 12 }}>Usage you log is attributed to this name.</div>
     <div style={{ position: "relative", marginBottom: 14 }}><Search size={17} color={T.muted} style={{ position: "absolute", left: 12, top: 14 }} /><Input placeholder="Find your name…" value={q} onChange={(e) => setQ(e.target.value)} style={{ paddingLeft: 38 }} /></div>
-    {Group("CHAIR", chair)}{Group("PROGRAM DIRECTORS", pds)}{Group("FULL ACCESS", full)}{Group("LAB MEMBERS", rest)}{Group("BOOKING ONLY", guests)}
+    {Group("CHAIR", chair)}{Group("PROGRAM DIRECTORS", pds)}{Group("FULL ACCESS", full)}{Group("PURCHASING", purch)}{Group("LAB MEMBERS", rest)}{Group("BOOKING ONLY", guests)}
     {list.length === 0 && <EmptyNote>No name matches "{q}".</EmptyNote>}
   </div>);
 }
@@ -619,8 +630,8 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
       {shown.length === 0 ? <EmptyNote>{view === "act" ? "Nothing needs your action right now." : view === "mine" ? "You haven't requested anything yet." : "No orders yet."}</EmptyNote>
         : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onRoute={() => setRouting(o)} onEdit={() => setEditO(o)} />)}
 
-      {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} grants={grants} inv={inv} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
-      {editO && <OrderForm me={me} projects={projects} grants={grants} inv={inv} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
+      {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} grants={grants} inv={inv} approvers={approverNames} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
+      {editO && <OrderForm me={me} projects={projects} grants={grants} inv={inv} approvers={approverNames} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
       {routing && <RouteSheet o={routing} approvers={approverNames} onConfirm={(approver) => { onAction(routing.id, "route", { approver }); setRouting(null); }} onClose={() => setRouting(null)} />}
       {receiving && <ReceiveSheet o={receiving} onConfirm={(addItem) => { onAction(receiving.id, "receive", { addItem }); setReceiving(null); }} onClose={() => setReceiving(null)} />}
     </div>
@@ -655,6 +666,7 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
         {o.grantName && <span>· {o.grantName}</span>}{o.project && <span>· {o.project}</span>}<span>· {shortName(o.requester || "")}</span>
       </div>
       {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
+      {o.status === "requested" && o.requestedApprover && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>For approval by:</b> {shortName(o.requestedApprover)}</div>}
       {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.piApprover ? ` · assigned by ${shortName(o.piApprover)}` : ""}</div>}
       {o.explored && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}><b style={{ color: T.ink, fontWeight: 600 }}>Explored:</b> {o.explored}</div>}
       {o.checklist && Object.keys(o.checklist).length > 0 && (
@@ -694,9 +706,9 @@ const CHECKLIST = [
   ["price", "I compared vendor pricing or have a quote"],
 ];
 
-function OrderForm({ me, projects, grants, inv, existing, seed, onSave, onClose }) {
+function OrderForm({ me, projects, grants, inv, approvers, existing, seed, onSave, onClose }) {
   const isEdit = !!existing;
-  const [f, setF] = useState(existing ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", grantId: existing.grantId || "", grantName: existing.grantName || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "" } : { id: uid(), itemName: seed ? seed.name : "", catalog: seed ? seed.catalog || "" : "", vendor: seed ? seed.vendor || "" : "", qty: "1", unitPrice: "", project: seed && seed.scope === "Project" ? seed.project : "", grantId: "", grantName: "", experiment: "", notes: "", dupAck: !!seed, explored: seed ? `Raised from the inventory record: ${seed.qty !== "" && seed.qty != null ? seed.qty + " " + (seed.unit || "") : "no quantity recorded"} at ${locLine(seed)}.` : "", fromItemId: seed ? seed.id : "" });
+  const [f, setF] = useState(existing ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", grantId: existing.grantId || "", grantName: existing.grantName || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "", requestedApprover: existing.requestedApprover || "" } : { id: uid(), itemName: seed ? seed.name : "", catalog: seed ? seed.catalog || "" : "", vendor: seed ? seed.vendor || "" : "", qty: "1", unitPrice: "", project: seed && seed.scope === "Project" ? seed.project : "", grantId: "", grantName: "", experiment: "", notes: "", dupAck: !!seed, explored: seed ? `Raised from the inventory record: ${seed.qty !== "" && seed.qty != null ? seed.qty + " " + (seed.unit || "") : "no quantity recorded"} at ${locLine(seed)}.` : "", fromItemId: seed ? seed.id : "", requestedApprover: "" });
   const [ck, setCk] = useState({});
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const toggle = (k) => setCk((s) => ({ ...s, [k]: !s[k] }));
@@ -704,7 +716,7 @@ function OrderForm({ me, projects, grants, inv, existing, seed, onSave, onClose 
   const total = (parseFloat(f.qty) || 0) * (parseFloat(f.unitPrice) || 0);
   const ckDone = isEdit || CHECKLIST.every((c) => ck[c[0]]);
   const ckCount = CHECKLIST.filter((c) => ck[c[0]]).length;
-  const ok = f.itemName.trim() && f.experiment.trim() && ckDone && (!dup || f.dupAck);
+  const ok = f.itemName.trim() && f.experiment.trim() && f.requestedApprover && ckDone && (!dup || f.dupAck);
   const submit = () => { if (!ok) return; const g = grants.find((x) => x.id === f.grantId); onSave({ ...f, total, unitPrice: parseFloat(f.unitPrice) || 0, grantName: g ? g.name : "", ...(isEdit ? {} : { checklist: ck }) }); };
   const seedGrant = grants.find((x) => x.id === f.grantId);
   return (
@@ -718,6 +730,13 @@ function OrderForm({ me, projects, grants, inv, existing, seed, onSave, onClose 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Quantity"><Input inputMode="decimal" value={f.qty} onChange={(e) => set("qty", e.target.value)} /></Field><Field label="Unit price ($)"><Input inputMode="decimal" value={f.unitPrice} onChange={(e) => set("unitPrice", e.target.value)} placeholder="0.00" /></Field></div>
       <div style={{ fontSize: 13, color: T.muted, marginTop: -4, marginBottom: 14 }}>Estimated total: <b style={{ color: T.ink }}>{money(total)}</b></div>
       <Field label="Project"><Select value={f.project} onChange={(e) => set("project", e.target.value)}><option value="">—</option>{projects.map((p) => <option key={p.id}>{p.name}</option>)}</Select></Field>
+      <Field label="Send to which PI for approval? *">
+        <Select value={f.requestedApprover} onChange={(e) => set("requestedApprover", e.target.value)}>
+          <option value="">Select the PI who should approve…</option>
+          {(approvers || []).map((n) => <option key={n}>{n}</option>)}
+        </Select>
+      </Field>
+      <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>Your request goes to Megan, who sends it to this person for the FRS / grant.</div>
       <Field label="Grant / fund"><Select value={f.grantId} onChange={(e) => set("grantId", e.target.value)}><option value="">—</option>{grants.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}</Select></Field>
       <Field label="Reason — experiment / justification *"><Input value={f.experiment} onChange={(e) => set("experiment", e.target.value)} placeholder="What is it for? e.g. P-gp WB, Aim 2" /></Field>
 
@@ -772,14 +791,18 @@ function NotifSheet({ notifs, onSeen, onSeenAll, onGo, onClose }) {
 }
 
 function RouteSheet({ o, approvers, onConfirm, onClose }) {
-  const [who, setWho] = useState(approvers[0] || "");
+  // Pre-selected to whoever the requester named, so Megan is confirming
+  // rather than guessing. She can still change it.
+  const [who, setWho] = useState(o.requestedApprover || approvers[0] || "");
   return (<Sheet title="Route for approval" onClose={onClose}>
     <div style={{ fontSize: 14, marginBottom: 4, fontWeight: 600 }}>{o.itemName}</div>
     <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 16 }}>{[o.qty && `×${o.qty}`, money(o.total), o.requester && "from " + shortName(o.requester)].filter(Boolean).join(" · ")}</div>
+    {o.requestedApprover && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.accentInk, background: "#E6F3F4", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
+      <User size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The requester designated <b>{o.requestedApprover}</b> for the FRS / grant.</div></div>}
     <Field label="Send to for final approval">
       <Select value={who} onChange={(e) => setWho(e.target.value)}>{approvers.map((n) => <option key={n}>{n}</option>)}</Select>
     </Field>
-    <div style={{ fontSize: 12, color: T.muted, marginBottom: 14 }}>Final approval must come from the Chair or a program director.</div>
+    <div style={{ fontSize: 12, color: T.muted, marginBottom: 14 }}>Final approval and the FRS must come from the Chair or a program director.</div>
     <Btn onClick={() => who && onConfirm(who)} style={{ opacity: who ? 1 : .5 }}><Send size={16} />Send for approval</Btn>
   </Sheet>);
 }
