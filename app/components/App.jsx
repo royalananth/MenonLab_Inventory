@@ -62,6 +62,8 @@ export default function App() {
   const [token, setToken] = useState("");
   const [srvCaps, setSrvCaps] = useState(null);
   const [instrAccess, setInstrAccess] = useState([]);
+  const [orderEvents, setOrderEvents] = useState([]);
+  const [chairLimit, setChairLimit] = useState(1000);
   const [members, setMembers] = useState([]);
   const [cats, setCats] = useState([]);
   const [projects, setProjects] = useState([]);
@@ -97,6 +99,7 @@ export default function App() {
       setInv(d.items || []); setUsage(d.usage || []); setGrants(d.grants || []); setOrders(d.orders || []);
       setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []);
       setMediaPar(d.mediaPar || []); setInstrAccess(d.instrumentAccess || []);
+      setOrderEvents(d.orderEvents || []); setChairLimit(d.chairThreshold || 1000);
     } catch { /* keep last good state */ }
     setSyncing(false); setReady(true);
   }, [clearLocal]);
@@ -161,14 +164,24 @@ export default function App() {
   const delGrant = (id) => { setGrants((s) => s.filter((g) => g.id !== id)); post({ type: "grant", action: "delete", payload: { id } }); };
   const createOrder = (o) => { setOrders((s) => [{ ...o, status: "requested", requester: me, createdAt: new Date().toISOString() }, ...s]); post({ type: "order", action: "create", payload: o }); flash("Sent to " + shortName(o.approver || "") + " for approval"); };
   const updateOrder = (o) => { setOrders((s) => s.map((x) => x.id === o.id ? { ...x, ...o } : x)); post({ type: "order", action: "update", payload: o }); flash("Request updated"); };
-  const STMAP = { approve: "approved", place: "ordered", receive: "received", reject: "rejected" };
-  const orderAction = (id, action, extra = {}) => {
-    setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "approve" ? { piApprover: me, frs: extra.frs || o.frs, grantId: extra.grantId || o.grantId, grantName: extra.grantName || o.grantName } : action === "reassign" ? { approver: extra.approver } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
-    post({ type: "order", action, payload: { id, ...extra } });
+  const STMAP = { place: "ordered", receive: "received", reject: "rejected", chairApprove: "approved" };
+  const orderAction = async (id, action, extra = {}) => {
+    // The server decides whether a PD approval ends the chain or hands it to the
+    // chair, so don't guess the next status for that one — just reload.
+    if (action !== "approve") {
+      setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "chairApprove" ? { piApprover: me } : action === "reassign" ? { approver: extra.approver } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
+    }
+    const r = await post({ type: "order", action, payload: { id, ...extra } });
+    if (!r || !r.ok) return;
+    const o = orders.find((x) => x.id === id);
+    const amount = o ? Number(o.total) || 0 : 0;
     if (action === "receive" && extra.addItem) flash("Received - added to inventory");
-    else if (action === "approve") flash("Approved - sent to purchasing");
+    else if (action === "approve") flash(amount >= chairLimit ? "Approved - sent to Dr. Menon" : "Approved - sent to Megan");
+    else if (action === "chairApprove") flash("Approved - sent to Megan");
+    else if (action === "place") flash("Marked placed");
     else flash("Updated");
   };
+  const setChairThreshold = async (value) => { const r = await post({ type: "setting", action: "chairThreshold", payload: { value } }); if (r && r.ok) flash("Approval limit updated"); };
   const delOrder = (id) => { setOrders((s) => s.filter((o) => o.id !== id)); post({ type: "order", action: "delete", payload: { id } }); };
   const addBooking = (b) => { setBookings((s) => [...s, b]); post({ type: "booking", action: "add", payload: b }); flash("Booked"); };
   const delBooking = (id) => { setBookings((s) => s.filter((b) => b.id !== id)); post({ type: "booking", action: "delete", payload: { id } }); flash("Cancelled"); };
@@ -181,6 +194,7 @@ export default function App() {
 
   const setMemberRole = (name, role) => { setMembers((s) => s.map((m) => m.name === name ? { ...m, role } : m)); post({ type: "member", action: "setRole", payload: { name, role } }); };
   const setOwner = (name, owner) => { post({ type: "member", action: "setOwner", payload: { name, owner } }); flash(owner ? "Can now grant access" : "Access-owner right removed"); };
+  const setPhone = async (name, whatsapp) => { const r = await post({ type: "member", action: "setPhone", payload: { name, whatsapp } }); if (r && r.ok) flash(whatsapp ? "WhatsApp number saved" : "Number removed"); };
 
   const memberNames = members.map((m) => m.name);
   const pdNames = members.filter((m) => m.pd).map((m) => m.name);
@@ -243,10 +257,10 @@ export default function App() {
 
         {view === "log" && <LogTab {...{ me, inv, usage, cats, onLog: logUsage, onUpdateUsage: updateUsage, onDeleteUsage: deleteUsage }} />}
         {view === "inv" && <InvTab {...{ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert: upsertItem, onDelete: deleteItem, onBulkPar: bulkPar, onRequest: (seed) => { setOrderSeed(seed); setTab("ord"); } }} />}
-        {view === "ord" && <OrdersTab {...{ me, caps, token, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
+        {view === "ord" && <OrdersTab {...{ me, caps, token, orders, orderEvents, chairLimit, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
         {view === "book" && <BookTab {...{ me, canEdit, instruments, bookings, memberNames, myAccess, accessQueue, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument, onRequestAccess: requestAccess, onDecideAccess: decideAccess }} />}
         {view === "rep" && <RepTab {...{ usage, memberNames }} />}
-        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onSetOwner: setOwner, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat, onReload: load, flash }} />}
+        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onSetOwner: setOwner, onSetPhone: setPhone, chairLimit, onSetChairLimit: setChairThreshold, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat, onReload: load, flash }} />}
         {view === "me" && <MeTab {...{ me, meRec, caps, token, onSignOut: signOut, flash }} />}
 
         <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: "#fff", borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: `repeat(${isGuest ? 2 : 6},1fr)`, height: 66, zIndex: 20 }}>
@@ -609,7 +623,7 @@ function RepTab({ usage, memberNames }) {
 }
 
 /* ---------- MANAGE ---------- */
-function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember, onDelMember, onToggleAdmin, onSetRole, onSetOwner, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat, onReload, flash }) {
+function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember, onDelMember, onToggleAdmin, onSetRole, onSetOwner, onSetPhone, chairLimit, onSetChairLimit, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat, onReload, flash }) {
   const [nm, setNm] = useState(""); const [nmEmail, setNmEmail] = useState(""); const [nmRole, setNmRole] = useState("member");
   const resetPin = async (name) => {
     if (!window.confirm(`Clear ${shortName(name)}'s PIN? They will choose a new one next time they sign in, and any device they are signed in on is signed out.`)) return;
@@ -660,8 +674,12 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdi
                 <input type="checkbox" checked={!!m.owner} onChange={(e) => onSetOwner(m.name, e.target.checked)} style={{ width: 16, height: 16 }} />
                 <span style={{ display: "flex", alignItems: "center", gap: 5 }}><Shield size={13} color={m.owner ? T.accent : T.muted} />Can grant access to others</span>
               </label>
+              <PhoneRow m={m} onSave={onSetPhone} />
             </div>
           </div>))}</div>
+
+        <div style={{ fontSize: 11.5, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 8 }}>CHAIR APPROVAL LIMIT</div>
+        <ChairLimitRow value={chairLimit} onSave={onSetChairLimit} />
 
         <div style={{ fontSize: 11.5, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 8 }}>ADD SOMEONE</div>
         <Field label="Name"><Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="Last, First" /></Field>
@@ -848,6 +866,55 @@ function PendingBanner({ orders, me, caps, accessQueue, view, onOrders, onAccess
   );
 }
 
+/* The line above which Dr. Menon has to sign off. Below it, a PD's approval is
+   final and the order goes straight to Megan. */
+function ChairLimitRow({ value, onSave }) {
+  const [v, setV] = useState(String(value ?? 1000));
+  useEffect(() => { setV(String(value ?? 1000)); }, [value]);
+  const dirty = String(v).trim() !== String(value);
+  const valid = v.trim() !== "" && !isNaN(+v) && +v >= 0;
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 12, color: T.muted, marginBottom: 8, lineHeight: 1.45 }}>
+        Orders at or above this go to Dr. Menon after the PD. Below it, the PD&apos;s approval is final and it goes straight to Megan. Set 0 to send everything to him.
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 15, fontWeight: 700, color: T.muted }}>$</span>
+        <Input value={v} onChange={(e) => setV(e.target.value)} inputMode="decimal" style={{ height: 40 }} />
+        {dirty && valid && <button onClick={() => onSave(+v)}
+          style={{ flexShrink: 0, background: T.accent, color: "#fff", border: "none", borderRadius: 9, padding: "10px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Save</button>}
+      </div>
+      {dirty && !valid && <div style={{ fontSize: 11.5, color: T.danger, marginTop: 5 }}>That needs to be a dollar amount.</div>}
+    </div>
+  );
+}
+
+/* The WhatsApp number an approval is sent to — and the number a reply is
+   matched against when it comes back. */
+function PhoneRow({ m, onSave }) {
+  const [v, setV] = useState(m.whatsapp || "");
+  const [editing, setEditing] = useState(false);
+  useEffect(() => { if (!editing) setV(m.whatsapp || ""); }, [m.whatsapp, editing]);
+  const approver = m.pd || m.role === "chair";
+  const dirty = (v || "") !== (m.whatsapp || "");
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+        <Input value={v} onChange={(e) => { setV(e.target.value); setEditing(true); }}
+          onBlur={() => { if (!dirty) setEditing(false); }}
+          placeholder="WhatsApp number, e.g. +1 409 555 0134"
+          inputMode="tel"
+          style={{ height: 36, fontSize: 12.5 }} />
+        {dirty && <button onClick={() => { onSave(m.name, v.trim()); setEditing(false); }}
+          style={{ flexShrink: 0, background: T.accent, color: "#fff", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Save</button>}
+      </div>
+      {approver && !m.whatsapp && <div style={{ fontSize: 11.5, color: T.amber, marginTop: 4, display: "flex", alignItems: "flex-start", gap: 5, lineHeight: 1.4 }}>
+        <AlertTriangle size={12} style={{ flexShrink: 0, marginTop: 2 }} />No number — approvals for {shortName(m.name)} stay in the app only.
+      </div>}
+    </div>
+  );
+}
+
 /* ---------- your account ---------- */
 function MeTab({ me, meRec, caps, token, onSignOut, flash }) {
   const [oldPin, setOldPin] = useState("");
@@ -890,6 +957,9 @@ function MeTab({ me, meRec, caps, token, onSignOut, flash }) {
       <div style={{ fontSize: 16, fontWeight: 700 }}>{me}</div>
       <div style={{ fontSize: 12.5, color: T.accent, fontWeight: 600, marginTop: 3 }}>{roleLabel}</div>
       {meRec.email && <div style={{ fontSize: 12.5, color: T.muted, marginTop: 3 }}>{meRec.email}</div>}
+      {meRec.whatsapp
+        ? <div style={{ fontSize: 12.5, color: T.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 5 }}><Send size={12} />WhatsApp {meRec.whatsapp}</div>
+        : (caps.approve ? <div style={{ fontSize: 12, color: T.amber, marginTop: 5, lineHeight: 1.45 }}>No WhatsApp number on file — approvals reach you in the app only. An access owner can add it under Manage.</div> : null)}
       <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.line}` }}>
         <div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, marginBottom: 7 }}>YOU CAN</div>
         {allowed.map((a) => <div key={a} style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.ink, marginBottom: 5 }}><Check size={14} color={T.accent} style={{ flexShrink: 0, marginTop: 2 }} />{a}</div>)}
@@ -934,12 +1004,19 @@ function incomplete(i) { return !((i.vendor || "").trim()) || !((i.catalog || ""
 function shortName(n) { return n.includes(",") ? n.split(",")[0].trim() : n.split(" ")[0]; }
 
 /* ---------- ORDERS / PURCHASING ---------- */
-const ORDER_STATUS = { requested: ["Awaiting PI approval", "#6D3BB5"], routed: ["Awaiting PI approval", "#6D3BB5"], approved: ["Ready to order", "#1D4ED8"], ordered: ["Ordered", "#0E7C86"], received: ["Received", "#127449"], rejected: ["Sent back", "#B42318"] };
+const ORDER_STATUS = {
+  requested: ["Awaiting PD", "#6D3BB5"], routed: ["Awaiting PD", "#6D3BB5"],
+  pd_ok: ["Awaiting Dr. Menon", "#B45309"],
+  approved: ["Ready for Megan", "#1D4ED8"], ordered: ["Ordered", "#0E7C86"],
+  received: ["Received", "#127449"], rejected: ["Sent back", "#B42318"],
+};
+const EVENT_LABEL = { requested: "Requested", edited: "Edited", reassigned: "Passed to another PD", pd_approved: "PD approved", chair_approved: "Chair approved", approved: "Approved", placed: "Placed on UTMB site", received: "Received", sent_back: "Sent back", deleted: "Cancelled" };
 const money = (n) => "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 // Requester -> PI -> purchasing. An order waiting on approval belongs to the
 // PI it was addressed to, not to whoever happens to be an admin.
 const awaitingMe = (o, me, caps) => {
   if (o.status === "requested" || o.status === "routed") return caps.approve && (o.approver === me || !o.approver);
+  if (o.status === "pd_ok") return caps.chairBackup;
   if (o.status === "approved" || o.status === "ordered") return caps.place;
   return false;
 };
@@ -949,20 +1026,22 @@ function pendingFor(orders, me, caps) {
 }
 const committedFor = (orders, gid) => orders.filter((o) => o.grantId === gid && (o.status === "ordered" || o.status === "received")).reduce((s, o) => s + (Number(o.total) || 0), 0);
 
-function OrdersTab({ me, caps, token, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
+function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
   const [nw, setNw] = useState(false);
   useEffect(() => { if (orderSeed) setNw(true); }, [orderSeed]);
   const [editO, setEditO] = useState(null);
   const [view, setView] = useState("act");
   const [receiving, setReceiving] = useState(null);
   const [approving, setApproving] = useState(null);
+  const [chairing, setChairing] = useState(null);
   const [reassigning, setReassigning] = useState(null);
   const [showGrants, setShowGrants] = useState(false);
 
   const mine = orders.filter((o) => o.requester === me);
   const toAct = orders.filter((o) => awaitingMe(o, me, caps));
-  const anyRole = caps.approve || caps.place || caps.grants;
-  const shown = view === "mine" ? mine : view === "all" ? orders : toAct;
+  const anyRole = caps.approve || caps.place || caps.grants || caps.chairBackup;
+  const inChain = orders.filter((o) => ["requested", "routed", "pd_ok", "approved", "ordered"].includes(o.status));
+  const shown = view === "mine" ? mine : view === "all" ? orders : view === "queue" ? inChain : toAct;
 
   const exportToOrder = () => {
     const rows = orders.filter((o) => o.status === "approved").map((o) => ({ Item: o.itemName, "Cat#": o.catalog, Vendor: o.vendor, Qty: o.qty, "Unit $": o.unitPrice, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, "Approved by": o.piApprover, Reason: o.experiment }));
@@ -971,6 +1050,7 @@ function OrdersTab({ me, caps, token, orders, grants, projects, inv, members, ap
   // The full monthly pack (supply list, restocking, spend, fund availability)
   // is generated server-side so it can also be bookmarked or scheduled.
   const monthlyPack = () => { window.location.href = "/api/monthly?token=" + encodeURIComponent(token || ""); };
+  const weeklyPack = () => { window.location.href = "/api/weekly?token=" + encodeURIComponent(token || ""); };
   const exportMonthly = () => {
     const now = new Date(), m0 = new Date(now.getFullYear(), now.getMonth(), 1);
     const rows = orders.filter((o) => new Date(o.createdAt) >= m0).map((o) => ({ Date: fmtDate(o.createdAt), Item: o.itemName, Qty: o.qty, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, Status: (ORDER_STATUS[o.status] || [o.status])[0], Reason: o.experiment }));
@@ -1005,15 +1085,18 @@ function OrdersTab({ me, caps, token, orders, grants, projects, inv, members, ap
       {caps.grants && <button onClick={() => setShowGrants((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />{showGrants ? "Hide grant setup" : "Manage grants & budgets"}</button>}
       {showGrants && caps.grants && <GrantsPanel grants={grants} onUpsert={onUpsertGrant} onDel={onDelGrant} />}
       {caps.grants && <SpendPanel orders={orders} grants={grants} />}
-      {(caps.place || caps.grants) && (
+      {caps.reports && (
         <div style={{ marginBottom: 14 }}>
-          <Btn onClick={monthlyPack}><FileSpreadsheet size={16} />Monthly pack — supplies, restocking, spend, funds</Btn>
-          <div style={{ fontSize: 11.5, color: T.muted, marginTop: 6, lineHeight: 1.5 }}>Seven tabs: fund availability by grant, restocking list, media par levels, orders, spend by person, usage, and the full supply inventory.</div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 7 }}>
+            <Btn onClick={weeklyPack}><FileSpreadsheet size={16} />Weekly pack</Btn>
+            <Btn onClick={monthlyPack}><FileSpreadsheet size={16} />Monthly pack</Btn>
+          </div>
+          <div style={{ fontSize: 11.5, color: T.muted, lineHeight: 1.5 }}>Every order with its full chain — who requested, which PD approved, whether Dr. Menon signed off, the grant and FRS at each step, who placed it, and the PO. Plus what is stuck and with whom, spend by person, spend by approver, and the complete audit trail. The monthly pack adds inventory, restocking and instrument usage.</div>
         </div>
       )}
 
-      {anyRole && <div style={{ display: "flex", gap: 7, marginBottom: 12 }}>
-        {[["act", "Needs action", toAct.length], ["mine", "My requests", mine.length], ["all", "All", orders.length]].map(([k, label, n]) => (
+      {anyRole && <div style={{ display: "flex", gap: 7, marginBottom: 12, flexWrap: "wrap" }}>
+        {[["act", "Needs you", toAct.length], ["mine", "Mine", mine.length], ["queue", "In the chain", inChain.length], ["all", "All", orders.length]].map(([k, label, n]) => (
           <button key={k} onClick={() => setView(k)} style={{ flex: 1, border: `1px solid ${view === k ? T.accent : T.border}`, background: view === k ? T.accent : "#fff", color: view === k ? "#fff" : T.ink, borderRadius: 10, padding: "8px 6px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{label}{n > 0 ? ` · ${n}` : ""}</button>
         ))}
       </div>}
@@ -1027,28 +1110,45 @@ function OrdersTab({ me, caps, token, orders, grants, projects, inv, members, ap
       )}
 
       {shown.length === 0 ? <EmptyNote>{view === "act" ? "Nothing needs your action right now." : view === "mine" ? "You haven't requested anything yet." : "No orders yet."}</EmptyNote>
-        : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onApprove={() => setApproving(o)} onReassign={() => setReassigning(o)} onEdit={() => setEditO(o)} />)}
+        : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} events={orderEvents.filter((e) => e.orderId === o.id)} chairLimit={chairLimit} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onApprove={() => setApproving(o)} onChair={() => setChairing(o)} onReassign={() => setReassigning(o)} onEdit={() => setEditO(o)} />)}
 
       {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} approvers={approverNames} inv={inv} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
       {editO && <OrderForm me={me} projects={projects} approvers={approverNames} inv={inv} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
-      {approving && <ApproveSheet o={approving} grants={grants} orders={orders} onConfirm={(x) => { onAction(approving.id, "approve", x); setApproving(null); }} onClose={() => setApproving(null)} />}
+      {approving && <ApproveSheet o={approving} grants={grants} orders={orders} chairLimit={chairLimit} onConfirm={(x) => { onAction(approving.id, "approve", x); setApproving(null); }} onClose={() => setApproving(null)} />}
+      {chairing && <ChairSheet o={chairing} grants={grants} orders={orders} caps={caps} onConfirm={(x) => { onAction(chairing.id, "chairApprove", x); setChairing(null); }} onClose={() => setChairing(null)} />}
       {reassigning && <ReassignSheet o={reassigning} approvers={approverNames} onConfirm={(approver) => { onAction(reassigning.id, "reassign", { approver }); setReassigning(null); }} onClose={() => setReassigning(null)} />}
       {receiving && <ReceiveSheet o={receiving} onConfirm={(addItem) => { onAction(receiving.id, "receive", { addItem }); setReceiving(null); }} onClose={() => setReceiving(null)} />}
     </div>
   );
 }
 
-function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onReceive, onApprove, onReassign, onEdit }) {
+function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAction, onDelete, onReceive, onApprove, onChair, onReassign, onEdit }) {
+  const [trail, setTrail] = useState(false);
   const [st, color] = ORDER_STATUS[o.status] || [o.status, T.muted];
   const dup = inv.find((i) => i.name.toLowerCase().trim() === (o.itemName || "").toLowerCase().trim());
   const grant = grants.find((g) => g.id === o.grantId);
   const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
-  const waiting = o.status === "requested" || o.status === "routed";
-  const mineToApprove = waiting && caps.approve && (o.approver === me || !o.approver);
+  const atPd = o.status === "requested" || o.status === "routed";
+  const atChair = o.status === "pd_ok";
+  const minePd = atPd && caps.approve && (o.approver === me || !o.approver);
+  const mineChair = atChair && caps.chairBackup;
+  const willNeedChair = (Number(o.total) || 0) >= chairLimit;
   const reject = () => { const r = window.prompt("Reason for sending back?") || ""; onAction(o.id, "reject", { reason: r }); };
-  const place = () => { const po = window.prompt("PO / order reference (optional):") || ""; onAction(o.id, "place", { po }); };
+  const place = () => { const po = window.prompt("PO / order reference from the UTMB site (optional):") || ""; onAction(o.id, "place", { po }); };
+  const mine = minePd || mineChair;
+  const stripe = mineChair ? "#B45309" : minePd ? "#6D3BB5" : null;
+
+  // The chain, as a strip, so the current stage is obvious at a glance.
+  const stages = [
+    { key: "req", label: "Requested", who: o.requester, done: true },
+    { key: "pd", label: "PD", who: o.pdApprover, done: !!o.pdApprover, active: atPd },
+    ...(o.needsChair || willNeedChair ? [{ key: "chair", label: "Dr. Menon", who: o.needsChair ? o.piApprover : "", done: !!(o.needsChair && o.piApprover), active: atChair }] : []),
+    { key: "po", label: "Megan", who: o.purchaser, done: !!o.purchaser, active: o.status === "approved" },
+    { key: "got", label: "Received", who: "", done: o.status === "received", active: o.status === "ordered" },
+  ];
+
   return (
-    <div style={{ background: "#fff", border: `1px solid ${mineToApprove ? "#D8CBEE" : T.line}`, borderLeft: mineToApprove ? "3px solid #6D3BB5" : `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
+    <div style={{ background: "#fff", border: `1px solid ${stripe ? stripe + "55" : T.line}`, borderLeft: stripe ? `3px solid ${stripe}` : `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
         <div style={{ minWidth: 0 }}><div style={{ fontSize: 14.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.itemName}</div>
           <div style={{ fontSize: 11.5, color: T.muted, marginTop: 2 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div></div>
@@ -1058,29 +1158,64 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
         <span style={{ fontWeight: 700, color: T.ink }}>{money(o.total)}</span>
         {o.grantName && <span>· {o.grantName}</span>}{o.project && <span>· {o.project}</span>}<span>· {shortName(o.requester || "")}</span>
       </div>
-      {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
-      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.piApprover ? ` · assigned by ${shortName(o.piApprover)}` : ""}{o.approvedVia === "whatsapp" ? " · via WhatsApp" : ""}</div>}
+
+      {o.status !== "rejected" && <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", marginTop: 9, paddingTop: 9, borderTop: `1px solid ${T.line}` }}>
+        {stages.map((sg, i) => (
+          <span key={sg.key} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            {i > 0 && <ChevronRight size={12} color={T.border} />}
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, fontWeight: 700, borderRadius: 999, padding: "3px 8px",
+              background: sg.done ? "#EAF6EE" : sg.active ? (color + "18") : T.bg,
+              color: sg.done ? "#127449" : sg.active ? color : T.muted }}>
+              {sg.done && <Check size={10} />}{sg.label}{sg.who ? ` · ${shortName(sg.who)}` : ""}
+            </span>
+          </span>
+        ))}
+      </div>}
+
+      {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 6 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
+      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.pdApprover ? ` · proposed by ${shortName(o.pdApprover)}` : ""}{o.piApprover && o.needsChair ? ` · confirmed by ${shortName(o.piApprover)}` : ""}{o.approvedVia === "whatsapp" ? " · via WhatsApp" : ""}</div>}
+      {o.pdFrs && o.frs && o.pdFrs !== o.frs && <div style={{ fontSize: 11.5, color: T.amber, marginTop: 3 }}>Chair changed the account from FRS {o.pdFrs}{o.pdGrantName ? ` (${o.pdGrantName})` : ""}</div>}
+      {o.po && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>PO:</b> {o.po}{o.purchaser ? ` · ${shortName(o.purchaser)}` : ""}</div>}
       {o.explored && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}><b style={{ color: T.ink, fontWeight: 600 }}>Explored:</b> {o.explored}</div>}
       {o.checklist && Object.keys(o.checklist).length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#127449", background: "#EAF6EE", borderRadius: 8, padding: "5px 9px", marginTop: 8, width: "fit-content" }}>
           <ListChecks size={13} />Pre-order checklist completed ({Object.values(o.checklist).filter(Boolean).length}/7)
         </div>
       )}
-      {waiting && o.approver && <div style={{ fontSize: 11.5, color: "#6D3BB5", marginTop: 6 }}>With {shortName(o.approver)} for approval and funding</div>}
-      {dup && waiting && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: T.amber, background: "#FDF0DF", borderRadius: 8, padding: "6px 9px", marginTop: 8 }}><AlertTriangle size={14} />Already in lab: {dup.qty || "in stock"} at {locLine(dup)}. Cross-check first.</div>}
+      {atPd && willNeedChair && <div style={{ fontSize: 11.5, color: T.amber, marginTop: 7 }}>Over the {money(chairLimit)} limit — will need Dr. Menon after you.</div>}
+      {dup && atPd && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: T.amber, background: "#FDF0DF", borderRadius: 8, padding: "6px 9px", marginTop: 8 }}><AlertTriangle size={14} />Already in lab: {dup.qty || "in stock"} at {locLine(dup)}. Cross-check first.</div>}
       {grant && grant.budget > 0 && <div style={{ fontSize: 11.5, color: remaining < o.total ? T.danger : T.muted, marginTop: 8 }}>{grant.name}: {money(remaining)} available{remaining < o.total ? " — exceeds remaining budget" : ""}</div>}
       {o.rejectReason && o.status === "rejected" && <div style={{ fontSize: 12, color: T.danger, marginTop: 6 }}>Sent back: {o.rejectReason}</div>}
 
       <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-        {mineToApprove && <>
+        {minePd && <>
           <ActBtn onClick={onApprove} icon={CheckCircle2}>Approve + assign funding</ActBtn>
           <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn>
-          <ActBtn kind="ghost" onClick={onReassign} icon={Send}>Pass to another PI</ActBtn></>}
-        {o.status === "approved" && caps.place && <ActBtn onClick={place} icon={ShoppingCart}>Place order</ActBtn>}
+          <ActBtn kind="ghost" onClick={onReassign} icon={Send}>Pass to another PD</ActBtn></>}
+        {mineChair && <>
+          <ActBtn onClick={onChair} icon={CheckCircle2}>Final approval</ActBtn>
+          <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
+        {o.status === "approved" && caps.place && <ActBtn onClick={place} icon={ShoppingCart}>Mark placed on UTMB</ActBtn>}
         {o.status === "ordered" && caps.place && <ActBtn onClick={onReceive} icon={PackageCheck}>Mark received</ActBtn>}
-        {o.requester === me && waiting && <ActBtn kind="ghost" onClick={onEdit} icon={Pencil}>Edit</ActBtn>}
-        {((o.requester === me && (waiting || o.status === "rejected")) || (caps.place && o.status !== "received")) && <ActBtn kind="ghost" onClick={() => { if (window.confirm("Cancel and delete this order request?")) onDelete(o.id); }} icon={Trash2}>{o.requester === me ? "Delete" : "Cancel"}</ActBtn>}
+        {o.requester === me && atPd && <ActBtn kind="ghost" onClick={onEdit} icon={Pencil}>Edit</ActBtn>}
+        {((o.requester === me && (atPd || o.status === "rejected")) || (caps.place && o.status !== "received")) && <ActBtn kind="ghost" onClick={() => { if (window.confirm("Cancel and delete this order request?")) onDelete(o.id); }} icon={Trash2}>{o.requester === me ? "Delete" : "Cancel"}</ActBtn>}
+        {(events || []).length > 0 && <ActBtn kind="ghost" onClick={() => setTrail((v) => !v)} icon={ClipboardCheck}>{trail ? "Hide history" : `History (${events.length})`}</ActBtn>}
       </div>
+
+      {trail && (events || []).length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 9, borderTop: `1px solid ${T.line}` }}>
+          {[...events].sort((a, b) => new Date(a.at) - new Date(b.at)).map((e) => (
+            <div key={e.id} style={{ display: "flex", gap: 9, fontSize: 12, padding: "5px 0" }}>
+              <span style={{ width: 92, flexShrink: 0, color: T.muted, fontSize: 11 }}>{fmtTime(e.at)}</span>
+              <span style={{ minWidth: 0 }}>
+                <b style={{ fontWeight: 600 }}>{EVENT_LABEL[e.event] || e.event}</b>
+                <span style={{ color: T.muted }}> — {shortName(e.actor || "")}{e.via === "whatsapp" ? " (WhatsApp)" : ""}</span>
+                {e.detail && <span style={{ display: "block", color: T.muted, fontSize: 11.5, marginTop: 1, lineHeight: 1.4 }}>{e.detail}</span>}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1122,13 +1257,13 @@ function OrderForm({ me, projects, approvers, inv, existing, seed, onSave, onClo
       <div style={{ fontSize: 13, color: T.muted, marginTop: -4, marginBottom: 14 }}>Estimated total: <b style={{ color: T.ink }}>{money(total)}</b></div>
       <Field label="Project"><Select value={f.project} onChange={(e) => set("project", e.target.value)}><option value="">—</option>{projects.map((p) => <option key={p.id}>{p.name}</option>)}</Select></Field>
 
-      <Field label="Send to which PI for approval? *">
+      <Field label="Send to which PD for approval? *">
         <Select value={f.approver} onChange={(e) => set("approver", e.target.value)}>
           <option value="">—</option>{approvers.map((n) => <option key={n}>{n}</option>)}
         </Select>
       </Field>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14, lineHeight: 1.45 }}>
-        <DollarSign size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The PI chooses the grant and FRS when they approve. You don&apos;t pick the funding account.</div>
+        <DollarSign size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The PD chooses the grant and FRS when they approve, and Dr. Menon confirms it on larger orders. You don&apos;t pick the funding account.</div>
       </div>
 
       <Field label="Reason — experiment / justification *"><Input value={f.experiment} onChange={(e) => set("experiment", e.target.value)} placeholder="What is it for? e.g. P-gp WB, Aim 2" /></Field>
@@ -1186,7 +1321,7 @@ function NotifSheet({ notifs, onSeen, onSeenAll, onGo, onClose }) {
 
 /* The PI picks the grant and the FRS here. This is the single point where a
    funding account is attached to a purchase. */
-function ApproveSheet({ o, grants, orders, onConfirm, onClose }) {
+function ApproveSheet({ o, grants, orders, chairLimit, onConfirm, onClose }) {
   const [grantId, setGrantId] = useState(o.grantId || (grants[0] ? grants[0].id : ""));
   const [frs, setFrs] = useState(o.frs || "");
   const grant = grants.find((g) => g.id === grantId);
@@ -1202,6 +1337,7 @@ function ApproveSheet({ o, grants, orders, onConfirm, onClose }) {
       fundNote: grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "",
     });
   };
+  const toChair = (Number(o.total) || 0) >= chairLimit;
   return (<Sheet title="Approve and assign funding" onClose={onClose}>
     <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
     <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
@@ -1226,9 +1362,60 @@ function ApproveSheet({ o, grants, orders, onConfirm, onClose }) {
     <Field label="FRS / account number *">
       <Input value={frs} onChange={(e) => setFrs(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
     </Field>
-    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 16, lineHeight: 1.5 }}>Recorded on the order along with the fund position at the moment you approve, so the charge can be traced later.</div>
-    <Btn onClick={go} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Approve and send to purchasing</Btn>
+    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>Recorded on the order along with the fund position at the moment you approve, so the charge can be traced later.</div>
+    <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, background: toChair ? "#FDF0DF" : "#E6F3F4", color: toChair ? "#7A4A06" : T.accentInk, borderRadius: 10, padding: "10px 12px", marginBottom: 14, lineHeight: 1.45 }}>
+      {toChair ? <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} /> : <Check size={15} style={{ flexShrink: 0, marginTop: 1 }} />}
+      <div>{toChair
+        ? <>At {money(o.total)} this is over the {money(chairLimit)} limit, so it goes to <b>Dr. Menon</b> next. He can change the fund before it reaches Megan.</>
+        : <>Under the {money(chairLimit)} limit — this goes straight to <b>Megan</b> to place on the UTMB site.</>}</div>
+    </div>
+    <Btn onClick={go} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />{toChair ? "Approve and send to Dr. Menon" : "Approve and send to Megan"}</Btn>
     {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>An FRS account is required.</div>}
+  </Sheet>);
+}
+
+/* Stage two. The PD's proposed fund is pre-filled; Dr. Menon can accept it or
+   move the charge somewhere else before Megan places anything. */
+function ChairSheet({ o, grants, orders, caps, onConfirm, onClose }) {
+  const [grantId, setGrantId] = useState(o.grantId || "");
+  const [frs, setFrs] = useState(o.frs || o.pdFrs || "");
+  const grant = grants.find((g) => g.id === grantId);
+  const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
+  const over = grant && grant.budget > 0 && remaining < o.total;
+  const changed = (grantId || "") !== (o.pdGrantName ? (grants.find((g) => g.name === o.pdGrantName) || {}).id || "" : "") || frs.trim() !== (o.pdFrs || "");
+  const onBehalf = !caps.chair;
+  const ok = frs.trim().length > 0;
+  return (<Sheet title="Final approval" onClose={onClose}>
+    <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
+    <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 4 }}>{money(o.total)}</div>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 14 }}>Requested by {shortName(o.requester || "")}{o.project ? ` · ${o.project}` : ""}</div>
+
+    <div style={{ background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 11, padding: "11px 13px", marginBottom: 16 }}>
+      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 6 }}>WHAT THE PD PROPOSED</div>
+      <div style={{ fontSize: 13 }}>{shortName(o.pdApprover || "")} · {o.pdGrantName || "no grant"} · FRS <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.pdFrs || "none"}</span></div>
+      {o.fundNote && <div style={{ fontSize: 11.5, color: T.muted, marginTop: 3 }}>{o.fundNote}</div>}
+    </div>
+    {o.experiment && <div style={{ fontSize: 12.5, color: T.ink, marginBottom: 16, lineHeight: 1.45 }}><b>Reason:</b> {o.experiment}</div>}
+
+    <Field label="Charge to which grant?">
+      <Select value={grantId} onChange={(e) => setGrantId(e.target.value)}>
+        <option value="">— no grant —</option>
+        {grants.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+      </Select>
+    </Field>
+    {grant && grant.budget > 0 && (
+      <div style={{ fontSize: 12.5, color: over ? T.danger : T.muted, background: over ? "#FDECEC" : "#F6F8F9", border: `1px solid ${over ? "#F3C9C9" : T.border}`, borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14 }}>
+        {grant.name}: <b style={{ color: over ? T.danger : T.ink }}>{money(remaining)}</b> of {money(grant.budget)} remaining.
+        {over ? " This purchase exceeds what's left." : ` After this, ${money(remaining - o.total)}.`}
+      </div>
+    )}
+    <Field label="FRS / account number *">
+      <Input value={frs} onChange={(e) => setFrs(e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
+    </Field>
+    {changed && <div style={{ fontSize: 12, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "9px 11px", marginBottom: 14, lineHeight: 1.4 }}>You're changing the account the PD proposed. Both versions stay on the record.</div>}
+    {onBehalf && <div style={{ fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "9px 11px", marginBottom: 14, lineHeight: 1.4 }}>You're not the chair — this will be logged as given on his behalf, by you.</div>}
+    <Btn onClick={() => ok && onConfirm({ frs: frs.trim(), grantId })} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Approve and send to Megan</Btn>
   </Sheet>);
 }
 

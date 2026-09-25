@@ -13,7 +13,9 @@ const mapItem = (r) => ({
   owner: r.owner || "", received: r.received_date || "", minQty: r.min_qty || "", aliquots: r.aliquots || "",
 });
 const mapUsage = (r) => ({ id: r.id, member: r.member, itemId: r.item_id, itemName: r.item_name, category: r.category, qty: r.qty, unit: r.unit, project: r.project, experiment: r.experiment, room: r.room, fridge: r.fridge, box: r.box, notes: r.notes, date: r.ts });
-const mapOrder = (r) => ({ id: r.id, itemName: r.item_name, catalog: r.catalog, vendor: r.vendor, qty: r.qty, unitPrice: Number(r.unit_price) || 0, total: Number(r.total) || 0, project: r.project, grantId: r.grant_id, grantName: r.grant_name, experiment: r.experiment, notes: r.notes, requester: r.requester, status: r.status, dupAck: r.dup_ack, authorizer: r.authorizer, approver: r.approver, piApprover: r.pi_approver, piApprovedAt: r.pi_approved_at, purchaser: r.purchaser, po: r.po, orderedAt: r.ordered_at, receivedAt: r.received_at, rejectReason: r.reject_reason, createdAt: r.created_at, checklist: r.checklist ? JSON.parse(r.checklist) : null, explored: r.explored, frs: r.frs || "", fundNote: r.fund_note || "", fromItemId: r.from_item_id || "", approvedVia: r.approved_via || "" });
+const mapOrder = (r) => ({ id: r.id, itemName: r.item_name, catalog: r.catalog, vendor: r.vendor, qty: r.qty, unitPrice: Number(r.unit_price) || 0, total: Number(r.total) || 0, project: r.project, grantId: r.grant_id, grantName: r.grant_name, experiment: r.experiment, notes: r.notes, requester: r.requester, status: r.status, dupAck: r.dup_ack, authorizer: r.authorizer, approver: r.approver, piApprover: r.pi_approver, piApprovedAt: r.pi_approved_at, purchaser: r.purchaser, po: r.po, orderedAt: r.ordered_at, receivedAt: r.received_at, rejectReason: r.reject_reason, createdAt: r.created_at, checklist: r.checklist ? JSON.parse(r.checklist) : null, explored: r.explored, frs: r.frs || "", fundNote: r.fund_note || "", fromItemId: r.from_item_id || "", approvedVia: r.approved_via || "",
+  pdApprover: r.pd_approver || "", pdApprovedAt: r.pd_approved_at, pdFrs: r.pd_frs || "", pdGrantName: r.pd_grant_name || "",
+  needsChair: !!r.needs_chair, placedVia: r.placed_via || "" });
 
 const nid = () => "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 async function notify(recipients, kind, title, body, orderId) {
@@ -27,6 +29,24 @@ async function purchasingNames() {
   return (await q(`SELECT name FROM members WHERE role IN ('purchasing','admin')`)).rows.map((r) => r.name);
 }
 const short = (n) => (n || "").includes(",") ? n.split(",")[0].trim() : (n || "").split(" ")[0];
+const money = (n) => "$" + (Number(n) || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Nothing in the chain moves without a row here.
+async function logEvent(orderId, event, actor, detail, o, via) {
+  await q(`INSERT INTO order_events (id, order_id, event, actor, at, detail, amount, grant_name, frs, via)
+           VALUES ($1,$2,$3,$4,now(),$5,$6,$7,$8,$9)`,
+    ["ev" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), orderId, event, actor,
+      detail || "", o ? (Number(o.total) || 0) : null, o ? (o.grant_name || "") : "", o ? (o.frs || "") : "", via || "app"]);
+}
+
+export async function chairThreshold() {
+  const r = await q(`SELECT v FROM meta WHERE k='chair_threshold'`);
+  const n = Number(r.rows[0] && r.rows[0].v);
+  return isNaN(n) ? 1000 : n;
+}
+async function chairNames() {
+  return (await q(`SELECT name FROM members WHERE role='chair'`)).rows.map((r) => r.name);
+}
 
 // stock += (restoreQty - newQty), only when the item and both quantities are numeric
 async function adjustStock(itemId, newQty, restoreQty) {
@@ -49,8 +69,8 @@ export async function GET(req) {
   if (!me) return NextResponse.json({ signedIn: false, caps: caps(null) }, { status: 401 });
   const who = me.name;
 
-  const [members, categories, projects, items, usage, grants, orders, instruments, bookings, notifs, mediaPar, access] = await Promise.all([
-    q(`SELECT name,email,role,pd,owner,(pin_hash IS NOT NULL) AS has_pin FROM members ORDER BY name`),
+  const [members, categories, projects, items, usage, grants, orders, instruments, bookings, notifs, mediaPar, access, events, thr] = await Promise.all([
+    q(`SELECT name,email,role,pd,owner,whatsapp,(pin_hash IS NOT NULL) AS has_pin FROM members ORDER BY name`),
     q(`SELECT name FROM categories ORDER BY ord`),
     q(`SELECT id,name,leader FROM projects ORDER BY name`),
     q(`SELECT * FROM items ORDER BY name`),
@@ -62,13 +82,15 @@ export async function GET(req) {
     who ? q(`SELECT * FROM notifications WHERE recipient=$1 ORDER BY created_at DESC LIMIT 60`, [who]) : Promise.resolve({ rows: [] }),
     q(`SELECT * FROM media_par ORDER BY cell_type, name`),
     q(`SELECT * FROM instrument_access ORDER BY requested_at DESC LIMIT 2000`),
+    q(`SELECT * FROM order_events ORDER BY at DESC LIMIT 4000`),
+    q(`SELECT v FROM meta WHERE k='chair_threshold'`),
   ]);
 
   return NextResponse.json({
     signedIn: !!me,
     me: me ? { name: me.name, role: me.role, pd: me.pd, shared: me.shared } : null,
     caps: caps(me),
-    members: members.rows.map((m) => ({ name: m.name, email: m.email, role: m.role, pd: m.pd, owner: !!m.owner, hasPin: m.has_pin })),
+    members: members.rows.map((m) => ({ name: m.name, email: m.email, role: m.role, pd: m.pd, owner: !!m.owner, whatsapp: m.whatsapp || "", hasPin: m.has_pin })),
     categories: categories.rows.map((r) => r.name),
     projects: projects.rows,
     items: items.rows.map(mapItem),
@@ -80,6 +102,8 @@ export async function GET(req) {
     notifications: notifs.rows.map((n) => ({ id: n.id, kind: n.kind, title: n.title, body: n.body, orderId: n.order_id, seen: n.seen, date: n.created_at })),
     mediaPar: mediaPar.rows.map((p) => ({ id: p.id, cellType: p.cell_type, name: p.name, vendor: p.vendor, catalog: p.catalog, targetQty: p.target_qty, perStock: p.per_stock })),
     instrumentAccess: access.rows.map((a) => ({ id: a.id, instrumentId: a.instrument_id, instrumentName: a.instrument_name, member: a.member, status: a.status, note: a.note, requestedAt: a.requested_at, decidedAt: a.decided_at, decidedBy: a.decided_by })),
+    orderEvents: events.rows.map((e) => ({ id: e.id, orderId: e.order_id, event: e.event, actor: e.actor, at: e.at, detail: e.detail, amount: Number(e.amount) || 0, grantName: e.grant_name || "", frs: e.frs || "", via: e.via || "app" })),
+    chairThreshold: Number(thr.rows[0] && thr.rows[0].v) || 1000,
   });
 }
 
@@ -174,6 +198,16 @@ export async function POST(req) {
         if (payload.name === by) return deny("You can't change your own role.");
         await q(`UPDATE members SET role=$2 WHERE name=$1 AND pd=false`, [payload.name, payload.role]);
       }
+      else if (action === "setPhone") {
+        // The WhatsApp number an approval is sent to, and the number a reply is
+        // matched against. Identity for approvals, so owners only.
+        const raw = String(payload.whatsapp || "").trim();
+        const digits = raw.replace(/\D/g, "");
+        if (raw && digits.length < 10) return NextResponse.json({ ok: false, error: "That doesn't look like a full phone number — include the area code." }, { status: 400 });
+        const clash = raw ? (await q(`SELECT name FROM members WHERE name <> $1 AND whatsapp IS NOT NULL AND right(regexp_replace(whatsapp, '[^0-9]', '', 'g'), 10) = right($2, 10)`, [payload.name, digits])).rows[0] : null;
+        if (clash) return NextResponse.json({ ok: false, error: `That number is already on ${short(clash.name)}'s record.` }, { status: 409 });
+        await q(`UPDATE members SET whatsapp=$2 WHERE name=$1`, [payload.name, raw]);
+      }
       else if (action === "setOwner") {
         // Nominating another owner, or standing one down. Never the last one.
         const want = !!payload.owner;
@@ -201,28 +235,31 @@ export async function POST(req) {
     } else if (type === "order") {
       const p = payload;
       if (action === "create") {
-        // The requester supplies the item and names the PI. They do NOT pick a
-        // grant — funding is the PI's call, assigned at approval.
-        if (!p.approver) return NextResponse.json({ ok: false, error: "Name the PI who should approve this." }, { status: 400 });
+        // The requester names the PD. They do not pick a fund.
+        if (!p.approver) return NextResponse.json({ ok: false, error: "Name the PD who should approve this." }, { status: 400 });
         await q(`INSERT INTO orders (id,item_name,catalog,vendor,qty,unit_price,total,project,experiment,notes,requester,approver,status,dup_ack,checklist,explored,from_item_id,created_at)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'requested',$13,$14,$15,$16,now())`,
           [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.experiment || "", p.notes || "", by, p.approver, !!p.dupAck, JSON.stringify(p.checklist || {}), p.explored || "", p.fromItemId || ""]);
+        const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "requested", by, `${p.itemName} — ${money(p.total || 0)}, to ${short(p.approver)} for approval`, o, "app");
         await notify([p.approver], "approval", "Approval needed",
-          `${short(by)} requested ${p.itemName} — needs your approval and a funding account.`, p.id);
+          `${short(by)} requested ${p.itemName} (${money(p.total || 0)}) — needs your approval and a funding account.`, p.id);
       } else if (action === "update") {
         const o = (await q(`SELECT requester FROM orders WHERE id=$1`, [p.id])).rows[0];
         if (o && o.requester !== by && !c.edit) return deny("You can only edit your own requests.");
         await q(`UPDATE orders SET item_name=$2,catalog=$3,vendor=$4,qty=$5,unit_price=$6,total=$7,project=$8,experiment=$9,notes=$10,explored=$11,approver=COALESCE($12,approver) WHERE id=$1 AND status='requested'`,
           [p.id, p.itemName, p.catalog || "", p.vendor || "", (p.qty ?? "") + "", p.unitPrice || 0, p.total || 0, p.project || "", p.experiment || "", p.notes || "", p.explored || "", p.approver || null]);
+        const o2 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "edited", by, "Request details changed", o2, "app");
       } else if (action === "reassign") {
-        // Send it to a different PI.
         if (!c.approve && !c.edit) return deny("Only the chair and program directors can reassign an approval.");
         await q(`UPDATE orders SET approver=$2 WHERE id=$1 AND status='requested'`, [p.id, p.approver || ""]);
-        if (p.approver) await notify([p.approver], "approval", "Approval needed",
-          `${short(by)} passed an approval to you.`, p.id);
+        const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "reassigned", by, `Passed to ${short(p.approver)}`, o, "app");
+        if (p.approver) await notify([p.approver], "approval", "Approval needed", `${short(by)} passed an approval to you.`, p.id);
+
+      // ---------- stage one: the PD approves and proposes the funding ----------
       } else if (action === "approve") {
-        // PI reviews, picks the grant and FRS, and approves. This is the only
-        // point at which funding is decided.
         if (!c.approve) return deny("Only the chair and program directors can approve and assign funding.");
         const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
         if (!o0) return NextResponse.json({ ok: false, error: "No such order." }, { status: 404 });
@@ -230,32 +267,83 @@ export async function POST(req) {
         if (o0.approver && o0.approver !== by && me.role !== "chair") return deny(`This one was sent to ${short(o0.approver)}.`);
         if (!p.frs || !String(p.frs).trim()) return NextResponse.json({ ok: false, error: "An FRS account is required to approve." }, { status: 400 });
         const g = p.grantId ? (await q(`SELECT id,name,budget FROM grants WHERE id=$1`, [p.grantId])).rows[0] : null;
-        // Record the fund position as it stood at approval, so the decision can
-        // be read back later. Computed here rather than trusted from the client.
-        let fundNote = p.fundNote || "";
+        let fundNote = "";
         if (g) {
           const spent = (await q(`SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE grant_id=$1 AND status IN ('approved','ordered','received')`, [g.id])).rows[0];
-          const remaining = (Number(g.budget) || 0) - (Number(spent.s) || 0);
-          fundNote = `${g.name}: $${remaining.toFixed(2)} available at approval`;
+          fundNote = `${g.name}: ${money((Number(g.budget) || 0) - (Number(spent.s) || 0))} available at approval`;
         }
-        await q(`UPDATE orders SET status='approved', pi_approver=$2, pi_approved_at=now(), frs=$3, fund_note=$4,
-                        grant_id=$5, grant_name=$6, approved_via='app' WHERE id=$1 AND status='requested'`,
-          [p.id, by, String(p.frs).trim(), fundNote, g ? g.id : "", g ? g.name : (p.grantName || "")]);
+        // Above the line, Dr. Menon has to see it. Below, it goes straight to Megan.
+        const limit = await chairThreshold();
+        const amount = Number(o0.total) || 0;
+        const needsChair = amount >= limit;
+        const frs = String(p.frs).trim();
+        await q(`UPDATE orders SET status=$2, pd_approver=$3, pd_approved_at=now(), pd_frs=$4, pd_grant_id=$5, pd_grant_name=$6,
+                        frs=$4, grant_id=$5, grant_name=$6, fund_note=$7, needs_chair=$8, approved_via='app',
+                        pi_approver = CASE WHEN $8 THEN NULL ELSE $3 END,
+                        pi_approved_at = CASE WHEN $8 THEN NULL ELSE now() END
+                  WHERE id=$1 AND status='requested'`,
+          [p.id, needsChair ? "pd_ok" : "approved", by, frs, g ? g.id : "", g ? g.name : (p.grantName || ""), fundNote, needsChair]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "pd_approved", by,
+          `PD approval · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs}` + (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), o, "app");
+        if (needsChair) {
+          await notify(await chairNames(), "approval", "Chair approval needed",
+            `${short(by)} approved ${o.item_name} (${money(amount)}, ${g ? g.name : "no grant"}) — over the ${money(limit)} limit, needs your sign-off.`, p.id);
+          await notify([o.requester], "status", "PD approved",
+            `${short(by)} approved your request for ${o.item_name}. It now needs the chair's sign-off.`, p.id);
+        } else {
+          await notify(await purchasingNames(), "order", "Approved — ready to order",
+            `${o.item_name} approved by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place.`, p.id);
+          await notify([o.requester], "status", "Request approved", `${short(by)} approved your request for ${o.item_name}.`, p.id);
+        }
+
+      // ---------- stage two: the chair confirms, and may change the fund ----------
+      } else if (action === "chairApprove") {
+        if (!c.chairBackup) return deny("Only Dr. Menon can give final approval.");
+        const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        if (!o0) return NextResponse.json({ ok: false, error: "No such order." }, { status: 404 });
+        if (o0.status !== "pd_ok") return NextResponse.json({ ok: false, error: `That order is ${o0.status}, not waiting on the chair.` }, { status: 409 });
+        const onBehalf = me.role !== "chair";
+        // Keep the PD's proposal unless the chair changes it.
+        const gid = p.grantId !== undefined && p.grantId !== null ? p.grantId : o0.pd_grant_id;
+        const g = gid ? (await q(`SELECT id,name,budget FROM grants WHERE id=$1`, [gid])).rows[0] : null;
+        const frs = (p.frs !== undefined && String(p.frs).trim()) ? String(p.frs).trim() : (o0.pd_frs || "");
+        if (!frs) return NextResponse.json({ ok: false, error: "An FRS account is required." }, { status: 400 });
+        let fundNote = o0.fund_note || "";
+        if (g) {
+          const spent = (await q(`SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE grant_id=$1 AND status IN ('approved','ordered','received')`, [g.id])).rows[0];
+          fundNote = `${g.name}: ${money((Number(g.budget) || 0) - (Number(spent.s) || 0))} available at chair approval`;
+        }
+        const changed = (g ? g.id : "") !== (o0.pd_grant_id || "") || frs !== (o0.pd_frs || "");
+        await q(`UPDATE orders SET status='approved', pi_approver=$2, pi_approved_at=now(),
+                        frs=$3, grant_id=$4, grant_name=$5, fund_note=$6, approved_via='app' WHERE id=$1 AND status='pd_ok'`,
+          [p.id, by, frs, g ? g.id : "", g ? g.name : "", fundNote]);
+        const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "chair_approved", by,
+          `Final approval · ${money(Number(o0.total) || 0)} · ${g ? g.name : "no grant"} · FRS ${frs}` +
+          (changed ? ` (changed from ${o0.pd_grant_name || "no grant"} / FRS ${o0.pd_frs || "none"})` : "") +
+          (onBehalf ? " — given by the access owner on the chair's behalf" : ""), o, "app");
         await notify(await purchasingNames(), "order", "Approved — ready to order",
-          `${o ? o.item_name : "An order"} approved by ${short(by)} · FRS ${String(p.frs).trim()}${g ? " · " + g.name : ""}. Ready to place.`, p.id);
-        if (o) await notify([o.requester], "status", "Request approved",
-          `${short(by)} approved your request for ${o.item_name}.`, p.id);
+          `${o.item_name} cleared by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place on the UTMB site.`, p.id);
+        await notify([o.requester, o0.pd_approver], "status", "Request fully approved",
+          `${short(by)} gave final approval for ${o.item_name}.`, p.id);
+
       } else if (action === "place") {
-        if (!c.place) return deny("Only purchasing and full-access staff can place orders.");
-        await q(`UPDATE orders SET status='ordered', purchaser=$2, po=$3, ordered_at=now() WHERE id=$1 AND status='approved'`, [p.id, by, p.po || ""]);
+        if (!c.place) return deny("Only Megan places orders on the UTMB site.");
+        const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        if (!o0 || o0.status !== "approved") return NextResponse.json({ ok: false, error: o0 ? `That order is ${o0.status}, not ready to place.` : "No such order." }, { status: 409 });
+        const onBehalf = me.role !== "purchasing";
+        await q(`UPDATE orders SET status='ordered', purchaser=$2, po=$3, ordered_at=now(), placed_via=$4 WHERE id=$1 AND status='approved'`,
+          [p.id, by, p.po || "", onBehalf ? "owner" : "purchasing"]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
-        if (o) await notify([o.requester, o.approver], "status", "Order placed",
+        await logEvent(p.id, "placed", by, `Placed on the UTMB site${p.po ? ` · PO ${p.po}` : ""}${onBehalf ? " — by the access owner, not purchasing" : ""}`, o, "app");
+        await notify([o.requester, o.pd_approver, o.pi_approver], "status", "Order placed",
           `${short(by)} placed the order for ${o.item_name}${p.po ? " (PO " + p.po + ")" : ""}.`, p.id);
       } else if (action === "receive") {
-        if (!c.place) return deny("Only purchasing and full-access staff can record receipt.");
+        if (!c.place) return deny("Only Megan records receipt.");
         await q(`UPDATE orders SET status='received', received_at=now() WHERE id=$1`, [p.id]);
         const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "received", by, p.addItem ? "Received and added to inventory" : "Received", o0, "app");
         if (o0) await notify([o0.requester], "status", "Order received",
           `${o0.item_name} has arrived${p.addItem ? " and was added to inventory" : ""}.`, p.id);
         if (p.addItem) {
@@ -273,18 +361,28 @@ export async function POST(req) {
           }
         }
       } else if (action === "reject") {
-        const o0 = (await q(`SELECT approver, requester FROM orders WHERE id=$1`, [p.id])).rows[0];
-        const mayReject = c.approve || c.place || (o0 && o0.approver === by);
+        const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        const mayReject = c.approve || c.place || c.chairBackup || (o0 && o0.approver === by);
         if (!mayReject) return deny("You can't send this one back.");
         await q(`UPDATE orders SET status='rejected', reject_reason=$2 WHERE id=$1`, [p.id, p.reason || ""]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
-        if (o) await notify([o.requester], "status", "Request sent back",
+        await logEvent(p.id, "sent_back", by, `Sent back from ${o0 ? o0.status : "the queue"}${p.reason ? `: ${p.reason}` : ""}`, o, "app");
+        if (o) await notify([o.requester, o0 && o0.pd_approver], "status", "Request sent back",
           `${short(by)} sent back your request for ${o.item_name}${p.reason ? ": " + p.reason : ""}.`, p.id);
       } else if (action === "delete") {
         const o = (await q(`SELECT requester, status FROM orders WHERE id=$1`, [p.id])).rows[0];
         const mine = o && o.requester === by && (o.status === "requested" || o.status === "rejected");
         if (!mine && !c.place && !c.edit) return deny("You can't delete that request.");
+        const od = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
+        await logEvent(p.id, "deleted", by, `Request cancelled${od ? ` — ${od.item_name}` : ""}`, od, "app");
         await q(`DELETE FROM orders WHERE id=$1`, [p.id]);
+      }
+    } else if (type === "setting") {
+      if (!c.access) return deny("Only an access owner can change this.");
+      if (action === "chairThreshold") {
+        const n = Number(payload.value);
+        if (isNaN(n) || n < 0) return NextResponse.json({ ok: false, error: "That needs to be a dollar amount." }, { status: 400 });
+        await q(`INSERT INTO meta (k,v) VALUES ('chair_threshold',$1) ON CONFLICT (k) DO UPDATE SET v=$1`, [String(n)]);
       }
     } else if (type === "notification") {
       if (action === "seen") await q(`UPDATE notifications SET seen=true WHERE id=$1 AND recipient=$2`, [payload.id, by]);

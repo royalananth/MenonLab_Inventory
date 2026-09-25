@@ -29,8 +29,13 @@ export async function GET(req) {
   const rows = orderId
     ? (await q(`SELECT * FROM orders WHERE id = $1`, [orderId])).rows
     : (await q(
-        `SELECT * FROM orders WHERE status IN ('requested','routed') AND approver = $1 ORDER BY created_at ASC LIMIT 20`,
-        [me.name]
+        // What this person can act on: their own PD queue, plus the chair's
+        // queue if they are the chair.
+        `SELECT * FROM orders
+           WHERE (status IN ('requested','routed') AND approver = $1)
+              OR (status = 'pd_ok' AND $2 = 'chair')
+           ORDER BY created_at ASC LIMIT 20`,
+        [me.name, me.role || ""]
       )).rows;
 
   const orders = [];
@@ -51,7 +56,8 @@ export async function GET(req) {
       requester: o.requester || "",
       requesterShort: shortName(o.requester),
       status: o.status,
-      yoursToApprove: (o.status === "requested" || o.status === "routed") && o.approver === me.name,
+      stage: o.status === "pd_ok" ? "final approval" : "PD approval",
+      yoursToApprove: ((o.status === "requested" || o.status === "routed") && o.approver === me.name) || (o.status === "pd_ok" && me.role === "chair"),
       createdAt: o.created_at,
       spoken: shortName(o.requester) + " has requested " + o.item_name +
               (o.qty ? ", quantity " + o.qty : "") + ", " + money(o.total) +

@@ -1,43 +1,55 @@
+// The weekly accountability pack.
+//
+// Same sheets as the monthly one, scoped to a week, so nothing has to be
+// reconciled between the two. Nine tabs: what happened, what is stuck, every
+// order with its full chain, fund position, who spent, who authorised, the
+// audit trail, all orders all time, and usage.
+//
+// GET /api/weekly                      -> current week (Monday start)
+// GET /api/weekly?date=YYYY-MM-DD      -> the week containing that date
 import { ensureInit, q } from "../../../lib/db.js";
+import { sessionMember, caps } from "../../../lib/auth.js";
+import { loadReportData, addSheets } from "../../../lib/reports.js";
 import * as XLSX from "xlsx";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-function weekStart(d) { const x = new Date(d); const off = (x.getDay() + 6) % 7; x.setHours(0, 0, 0, 0); x.setDate(x.getDate() - off); return x; }
+function weekStart(d) {
+  const x = new Date(d);
+  const off = (x.getDay() + 6) % 7; // Monday
+  x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - off);
+  return x;
+}
 
-// GET /api/weekly            -> current week
-// GET /api/weekly?date=YYYY-MM-DD -> week containing that date
 export async function GET(req) {
   await ensureInit();
   const url = new URL(req.url);
-  const anchor = url.searchParams.get("date") ? new Date(url.searchParams.get("date")) : new Date();
-  const ws = weekStart(anchor);
-  const we = new Date(ws); we.setDate(we.getDate() + 7);
+  const me = await sessionMember(req.headers.get("x-session") || url.searchParams.get("token") || "");
+  if (!me) return new Response("Sign in to the app first, then use the Weekly pack button.", { status: 401 });
+  const c = caps(me);
+  if (!c.reports) return new Response("The weekly pack is for PIs and purchasing staff.", { status: 403 });
 
-  const rows = (await q(`SELECT * FROM usage_log WHERE ts >= $1 AND ts < $2 ORDER BY member, ts`, [ws.toISOString(), we.toISOString()])).rows;
-  const members = (await q(`SELECT name FROM members ORDER BY name`)).rows.map((r) => r.name);
+  const anchor = url.searchParams.get("date") ? new Date(url.searchParams.get("date") + "T00:00:00") : new Date();
+  const start = weekStart(anchor);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
 
-  const toRow = (u) => ({
-    Date: new Date(u.ts).toLocaleDateString(), Member: u.member, Item: u.item_name, Category: u.category,
-    Qty: u.qty, Unit: u.unit, Project: u.project, Experiment: u.experiment,
-    Room: u.room, Fridge: u.fridge, Box: u.box, Notes: u.notes,
-  });
+  const thr = (await q(`SELECT v FROM meta WHERE k='chair_threshold'`)).rows[0];
+  const threshold = Number(thr && thr.v) || 1000;
 
-  const wb = XLSX.utils.book_new();
-  const summary = members.map((m) => ({ Member: m, Entries: rows.filter((r) => r.member === m).length })).filter((r) => r.Entries);
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary.length ? summary : [{ Member: "—", Entries: 0 }]), "Summary");
-  members.forEach((m) => {
-    const list = rows.filter((r) => r.member === m);
-    if (list.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(list.map(toRow)), m.replace(/[\\/?*[\]:]/g, "").slice(0, 28));
-  });
+  const data = await loadReportData(start, end);
+  const inRange = (o) => o.created_at && new Date(o.created_at) >= start && new Date(o.created_at) < end;
+  const inRangeAt = (t) => t && new Date(t) >= start && new Date(t) < end;
+  const label = `Week of ${start.toLocaleDateString()} to ${new Date(end - 1).toLocaleDateString()}`;
 
+  const wb = addSheets(XLSX, XLSX.utils.book_new(), data, { label, inRange, inRangeAt, threshold });
   const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-  const fname = `MenonLab_Weekly_${ws.toISOString().slice(0, 10)}.xlsx`;
   return new Response(buf, {
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "Content-Disposition": `attachment; filename="${fname}"`,
+      "Content-Disposition": `attachment; filename="MenonLab_Weekly_${start.toISOString().slice(0, 10)}.xlsx"`,
     },
   });
 }

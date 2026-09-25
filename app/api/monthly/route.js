@@ -1,5 +1,6 @@
 import { ensureInit, q } from "../../../lib/db.js";
 import { sessionMember, caps } from "../../../lib/auth.js";
+import { loadReportData, addSheets } from "../../../lib/reports.js";
 import * as XLSX from "xlsx";
 
 export const dynamic = "force-dynamic";
@@ -162,12 +163,20 @@ export async function GET(req) {
   const add = (name, rows, empty) =>
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [empty]), name);
 
-  add("Fund availability", funds, { Grant: "No grants set up yet", Budget: 0, Committed: 0, Remaining: 0 });
+  // Orders, funds, spend and the audit trail come from the shared reporting
+  // module, so the weekly and monthly packs always agree.
+  const thr = (await q(`SELECT v FROM meta WHERE k='chair_threshold'`)).rows[0];
+  const threshold = Number(thr && thr.v) || 1000;
+  const reportData = await loadReportData(start, end);
+  addSheets(XLSX, wb, reportData, {
+    label: start.toLocaleDateString(undefined, { month: "long", year: "numeric" }),
+    inRange: (o) => o.created_at && new Date(o.created_at) >= start && new Date(o.created_at) < end,
+    inRangeAt: (t) => t && new Date(t) >= start && new Date(t) < end,
+    threshold,
+  });
+
   add("Restocking", restock, { Item: "Nothing at or below its par level", Category: "", "On hand": "", "Par level": "" });
   add("Media par levels", mediaSheet, { "Cell type": "—", Reagent: "", Vendor: "" });
-  add("Orders", orderRows, { Date: "", Status: "No orders this month", Item: "" });
-  add("Spend by person", spend, { Person: "No approved spend this month", Orders: 0, Total: 0 });
-  add("Usage", usageRows, { Date: "", Member: "No usage logged this month", Item: "" });
   add("Instrument usage", instrUsage, { Instrument: "No instruments set up", Sessions: 0, "Hours booked": 0 });
   add("Instrument by person", instrByPerson, { Instrument: "No bookings this month", Member: "", Sessions: 0 });
   add("Instrument access", accessRows, { Instrument: "No access requests yet", Member: "", Status: "" });
