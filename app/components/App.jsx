@@ -31,8 +31,12 @@ const CLONALITY = ["", "M", "P"];
 function lowStock(i) {
   const qty = i.qty === "" || i.qty == null || isNaN(+i.qty) ? null : +i.qty;
   if (qty === null) return false;
+  // Antibodies are counted in vials, but a record with no vials and a drawer
+  // full of aliquots is not out of stock.
+  const al = i.aliquots === "" || i.aliquots == null || isNaN(+i.aliquots) ? 0 : +i.aliquots;
+  const onHand = qty > 0 ? qty : (al > 0 ? al : qty);
   const min = i.minQty === "" || i.minQty == null || isNaN(+i.minQty) ? null : +i.minQty;
-  return min !== null ? qty <= min : qty <= 0;
+  return min !== null ? onHand <= min : onHand <= 0;
 }
 const UnitInput = (p) => (<><input {...p} list="unit-opts" style={{ ...inpStyle, ...(p.style || {}) }} placeholder={p.placeholder || "unit"} /><datalist id="unit-opts">{UNITS.map((u) => <option key={u} value={u} />)}</datalist></>);
 const Select = ({ children, ...p }) => <select {...p} style={{ ...inpStyle, appearance: "none", ...(p.style || {}) }}>{children}</select>;
@@ -55,6 +59,9 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [tab, setTab] = useState("log");
   const [me, setMe] = useState("");
+  const [token, setToken] = useState("");
+  const [srvCaps, setSrvCaps] = useState(null);
+  const [instrAccess, setInstrAccess] = useState([]);
   const [members, setMembers] = useState([]);
   const [cats, setCats] = useState([]);
   const [projects, setProjects] = useState([]);
@@ -69,23 +76,33 @@ export default function App() {
   const [showNotif, setShowNotif] = useState(false);
   const [orderSeed, setOrderSeed] = useState(null);
   const [toast, setToast] = useState("");
-  const flash = (t) => { setToast(t); setTimeout(() => setToast(""), 1900); };
-  const meRef = useRef("");
+  const flash = (t) => { setToast(t); setTimeout(() => setToast(""), 2600); };
+  const tokenRef = useRef("");
+  const unseenRef = useRef(0);
 
-  const load = useCallback(async () => {
-    setSyncing(true);
-    try {
-      const r = await fetch("/api/data?me=" + encodeURIComponent(meRef.current || ""), { cache: "no-store" });
-      const d = await r.json();
-      setMembers(d.members || []); setCats(d.categories || []); setProjects(d.projects || []);
-      setInv(d.items || []); setUsage(d.usage || []); setGrants(d.grants || []); setOrders(d.orders || []);
-      setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []); setMediaPar(d.mediaPar || []);
-    } catch { /* keep last good state */ }
-    setSyncing(false); setReady(true);
+  const clearLocal = useCallback(() => {
+    tokenRef.current = ""; setToken(""); setMe(""); setSrvCaps(null);
+    try { localStorage.removeItem("mlab_token"); } catch {}
   }, []);
 
+  const load = useCallback(async () => {
+    if (!tokenRef.current) { setReady(true); return; }
+    setSyncing(true);
+    try {
+      const r = await fetch("/api/data", { cache: "no-store", headers: { "x-session": tokenRef.current } });
+      if (r.status === 401) { clearLocal(); setSyncing(false); setReady(true); return; }
+      const d = await r.json();
+      setMe(d.me ? d.me.name : ""); setSrvCaps(d.caps || null);
+      setMembers(d.members || []); setCats(d.categories || []); setProjects(d.projects || []);
+      setInv(d.items || []); setUsage(d.usage || []); setGrants(d.grants || []); setOrders(d.orders || []);
+      setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []);
+      setMediaPar(d.mediaPar || []); setInstrAccess(d.instrumentAccess || []);
+    } catch { /* keep last good state */ }
+    setSyncing(false); setReady(true);
+  }, [clearLocal]);
+
   useEffect(() => {
-    try { const m = localStorage.getItem("mlab_me"); if (m) { setMe(m); meRef.current = m; } } catch {}
+    try { const t = localStorage.getItem("mlab_token"); if (t) { tokenRef.current = t; setToken(t); } } catch {}
     load();
     const iv = setInterval(load, 25000);
     const onFocus = () => load();
@@ -93,12 +110,38 @@ export default function App() {
     return () => { clearInterval(iv); window.removeEventListener("focus", onFocus); };
   }, [load]);
 
-  const pickMe = (n) => { setMe(n); meRef.current = n; try { localStorage.setItem("mlab_me", n); } catch {} load(); };
-  const post = async (body) => { try { const r = await fetch("/api/data", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!r.ok) throw 0; } catch {} load(); };
+  const signedIn = (tok) => {
+    tokenRef.current = tok; setToken(tok);
+    try { localStorage.setItem("mlab_token", tok); } catch {}
+    setReady(false); load();
+  };
+  const signOut = async () => {
+    const t = tokenRef.current;
+    clearLocal();
+    setTab("log");
+    try { await fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "logout", token: t }) }); } catch {}
+  };
+
+  // Errors used to be swallowed; now a refusal from the server is shown.
+  const post = async (body) => {
+    let out = { ok: false };
+    try {
+      const r = await fetch("/api/data", { method: "POST", headers: { "Content-Type": "application/json", "x-session": tokenRef.current }, body: JSON.stringify(body) });
+      out = await r.json().catch(() => ({ ok: r.ok }));
+      if (r.status === 401) { clearLocal(); flash("Signed out - please sign in again"); return out; }
+      if (!r.ok) flash(out.error || "That wasn't allowed");
+    } catch { /* offline: the next reload reconciles */ }
+    load();
+    return out;
+  };
 
   // granular handlers (optimistic + persist)
   const upsertItem = (item) => { setInv((s) => s.some((i) => i.id === item.id) ? s.map((i) => i.id === item.id ? item : i) : [...s, item]); post({ type: "item", action: "upsert", payload: item }); flash("Saved"); };
   const deleteItem = (id) => { setInv((s) => s.filter((i) => i.id !== id)); post({ type: "item", action: "delete", payload: { id } }); flash("Deleted"); };
+  const bulkPar = async (category, minQty, onlyMissing) => {
+    const r = await post({ type: "item", action: "bulkPar", payload: { category, minQty, onlyMissing } });
+    if (r && r.ok) flash(`Par level set on ${r.updated} item${r.updated === 1 ? "" : "s"}`);
+  };
   const logUsage = (entry) => {
     setUsage((s) => [entry, ...s]);
     if (entry.itemId && entry.qty && !isNaN(+entry.qty)) setInv((s) => s.map((i) => (i.id === entry.itemId && i.qty !== "" && !isNaN(+i.qty)) ? { ...i, qty: String(Math.max(0, +i.qty - +entry.qty)) } : i));
@@ -116,46 +159,60 @@ export default function App() {
   const delCat = (name) => { setCats((s) => s.filter((c) => c !== name)); post({ type: "category", action: "delete", payload: { name } }); };
   const upsertGrant = (g) => { setGrants((s) => s.some((x) => x.id === g.id) ? s.map((x) => x.id === g.id ? g : x) : [...s, g]); post({ type: "grant", action: "upsert", payload: g }); flash("Saved"); };
   const delGrant = (id) => { setGrants((s) => s.filter((g) => g.id !== id)); post({ type: "grant", action: "delete", payload: { id } }); };
-  const createOrder = (o) => { setOrders((s) => [{ ...o, status: "requested", requester: me, createdAt: new Date().toISOString() }, ...s]); post({ type: "order", action: "create", payload: { ...o, requester: me } }); flash("Request sent"); };
+  const createOrder = (o) => { setOrders((s) => [{ ...o, status: "requested", requester: me, createdAt: new Date().toISOString() }, ...s]); post({ type: "order", action: "create", payload: o }); flash("Sent to " + shortName(o.approver || "") + " for approval"); };
   const updateOrder = (o) => { setOrders((s) => s.map((x) => x.id === o.id ? { ...x, ...o } : x)); post({ type: "order", action: "update", payload: o }); flash("Request updated"); };
-  const STMAP = { route: "routed", approve: "approved", place: "ordered", receive: "received", reject: "rejected" };
+  const STMAP = { approve: "approved", place: "ordered", receive: "received", reject: "rejected" };
   const orderAction = (id, action, extra = {}) => {
-    setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "route" ? { authorizer: me, approver: extra.approver } : action === "approve" ? { piApprover: me, frs: extra.frs || o.frs } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
-    post({ type: "order", action, payload: { id, by: me, ...extra } });
-    if (action === "receive" && extra.addItem) flash("Received → inventory"); else flash("Updated");
+    setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "approve" ? { piApprover: me, frs: extra.frs || o.frs, grantId: extra.grantId || o.grantId, grantName: extra.grantName || o.grantName } : action === "reassign" ? { approver: extra.approver } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
+    post({ type: "order", action, payload: { id, ...extra } });
+    if (action === "receive" && extra.addItem) flash("Received - added to inventory");
+    else if (action === "approve") flash("Approved - sent to purchasing");
+    else flash("Updated");
   };
   const delOrder = (id) => { setOrders((s) => s.filter((o) => o.id !== id)); post({ type: "order", action: "delete", payload: { id } }); };
   const addBooking = (b) => { setBookings((s) => [...s, b]); post({ type: "booking", action: "add", payload: b }); flash("Booked"); };
   const delBooking = (id) => { setBookings((s) => s.filter((b) => b.id !== id)); post({ type: "booking", action: "delete", payload: { id } }); flash("Cancelled"); };
   const upsertInstrument = (ins) => { setInstruments((s) => s.some((x) => x.id === ins.id) ? s.map((x) => x.id === ins.id ? ins : x) : [...s, ins]); post({ type: "instrument", action: "upsert", payload: ins }); flash("Saved"); };
+  const requestAccess = (instrumentId, note) => { post({ type: "access", action: "request", payload: { instrumentId, note } }); flash("Access requested"); };
+  const decideAccess = (id, status, note) => { post({ type: "access", action: "decide", payload: { id, status, note } }); flash(status === "granted" ? "Access granted" : "Access declined"); };
   const delInstrument = (id) => { setInstruments((s) => s.filter((x) => x.id !== id)); post({ type: "instrument", action: "delete", payload: { id } }); };
   const markSeen = (id) => { setNotifs((s) => s.map((n) => n.id === id ? { ...n, seen: true } : n)); post({ type: "notification", action: "seen", payload: { id } }); };
   const markAllSeen = () => { setNotifs((s) => s.map((n) => ({ ...n, seen: true }))); post({ type: "notification", action: "seenAll", payload: { me } }); };
 
   const setMemberRole = (name, role) => { setMembers((s) => s.map((m) => m.name === name ? { ...m, role } : m)); post({ type: "member", action: "setRole", payload: { name, role } }); };
+  const setOwner = (name, owner) => { post({ type: "member", action: "setOwner", payload: { name, owner } }); flash(owner ? "Can now grant access" : "Access-owner right removed"); };
 
   const memberNames = members.map((m) => m.name);
   const pdNames = members.filter((m) => m.pd).map((m) => m.name);
+  // Requests go straight to a PI now, so this list is what the requester picks from.
   const approverNames = members.filter((m) => m.role === "chair" || m.pd).map((m) => m.name);
   const meRec = members.find((m) => m.name === me) || {};
-  const role = meRec.role, isPD = meRec.pd, isChair = role === "chair", isFull = role === "admin";
-  // "guest" = collaborators outside the lab (Yoshi, Zheping, the group downstairs)
-  // who Rheanna asked to be able to reserve instruments and nothing else.
-  const isGuest = role === "guest";
-  const canEdit = (isFull || isChair) && !isGuest;
-  // Dr. Menon, 10 Sep 2026: requests go to Megan (purchasing), who routes them
-  // to the named PI for FRS / grant. Full-access staff keep intake as a fallback.
-  const isPurchasing = role === "purchasing";
-  const caps = {
-    intake: (isFull || isPurchasing) && !isGuest,
-    approve: (isChair || isPD) && !isGuest,
-    place: (isFull || isPurchasing) && !isGuest,
-    grants: (isChair || isPD) && !isGuest,
-  };
+  // The server is the authority on what you may do; this is only for drawing the UI.
+  const caps = srvCaps || { approve: false, place: false, grants: false, edit: false, access: false, owner: false, guest: false, view: true, book: true, request: false, log: false };
+  const isGuest = !!caps.guest;
+  const canEdit = !!caps.edit;
   const unseen = notifs.filter((n) => !n.seen).length;
 
+  // A quiet browser notification when something new lands, so Megan sees an
+  // approved order without waiting on UTMB email.
+  useEffect(() => {
+    if (unseen > unseenRef.current && unseenRef.current !== 0) {
+      try {
+        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+          const n = notifs.find((x) => !x.seen);
+          if (n) new Notification(n.title, { body: n.body, tag: "mlab-" + n.id });
+        }
+      } catch {}
+    }
+    unseenRef.current = unseen;
+  }, [unseen, notifs]);
+
   if (!ready) return <div style={{ minHeight: "100vh", background: T.bg, display: "grid", placeItems: "center", color: T.muted, fontFamily: "system-ui" }}>Loading inventory…</div>;
+  if (!me) return <LoginGate onSignedIn={signedIn} />;
   const view = isGuest && !["book", "me"].includes(tab) ? "book" : tab;
+  const myAccess = instrAccess.filter((a) => a.member === me);
+  const accessQueue = instrAccess.filter((a) => a.status === "requested" &&
+    (canEdit || instruments.some((i) => i.id === a.instrumentId && i.superUser === me)));
 
   return (
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", background: T.bg, minHeight: "100vh", color: T.ink }}>
@@ -168,38 +225,36 @@ export default function App() {
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <button onClick={load} title="Refresh" style={{ background: "none", border: "none", cursor: "pointer", color: T.muted, padding: 4 }}><RefreshCw size={16} style={syncing ? { animation: "spin 1s linear infinite" } : undefined} /></button>
-              {me && <button onClick={() => setShowNotif(true)} title="Alerts" style={{ position: "relative", background: "none", border: "none", cursor: "pointer", color: unseen > 0 ? T.accent : T.muted, padding: 4 }}>
+              {<button onClick={() => setShowNotif(true)} title="Alerts" style={{ position: "relative", background: "none", border: "none", cursor: "pointer", color: unseen > 0 ? T.accent : T.muted, padding: 4 }}>
                 <Bell size={18} />
                 {unseen > 0 && <span style={{ position: "absolute", top: -1, right: -3, background: T.danger, color: "#fff", fontSize: 9.5, fontWeight: 700, borderRadius: 999, minWidth: 15, height: 15, display: "grid", placeItems: "center", padding: "0 3px" }}>{unseen}</span>}
               </button>}
               <button onClick={() => setTab("me")} style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${T.border}`, borderRadius: 999, padding: "6px 11px", cursor: "pointer", maxWidth: 130 }}>
                 {canEdit ? <Shield size={14} color={T.accent} /> : <User size={14} color={T.muted} />}
-                <span style={{ fontSize: 12.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{me ? shortName(me) : "Sign in"}</span>
+                <span style={{ fontSize: 12.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{shortName(me)}</span>
               </button>
             </div>
           </div>
         </header>
 
-        {!me && <div style={{ margin: 18, padding: 16, background: "#fff", border: `1px solid ${T.border}`, borderRadius: 14 }}>
-          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>Who are you?</div>
-          <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 12 }}>Pick your name so usage logs to you. Program directors and full-access staff can edit inventory.</div>
-          <Btn onClick={() => setTab("me")}>Choose your name</Btn>
-        </div>}
+        <PendingBanner
+          orders={orders} me={me} caps={caps} accessQueue={accessQueue} view={view}
+          onOrders={() => setTab("ord")} onAccess={() => setTab("book")} />
 
         {view === "log" && <LogTab {...{ me, inv, usage, cats, onLog: logUsage, onUpdateUsage: updateUsage, onDeleteUsage: deleteUsage }} />}
-        {view === "inv" && <InvTab {...{ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert: upsertItem, onDelete: deleteItem, onRequest: (seed) => { setOrderSeed(seed); setTab("ord"); } }} />}
-        {view === "ord" && <OrdersTab {...{ me, caps, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
-        {view === "book" && <BookTab {...{ me, canEdit, instruments, bookings, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument }} />}
+        {view === "inv" && <InvTab {...{ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert: upsertItem, onDelete: deleteItem, onBulkPar: bulkPar, onRequest: (seed) => { setOrderSeed(seed); setTab("ord"); } }} />}
+        {view === "ord" && <OrdersTab {...{ me, caps, token, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
+        {view === "book" && <BookTab {...{ me, canEdit, instruments, bookings, memberNames, myAccess, accessQueue, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument, onRequestAccess: requestAccess, onDecideAccess: decideAccess }} />}
         {view === "rep" && <RepTab {...{ usage, memberNames }} />}
-        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat }} />}
-        {view === "me" && <MeTab {...{ me, members, pickMe, setTab }} />}
+        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onSetOwner: setOwner, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat, onReload: load, flash }} />}
+        {view === "me" && <MeTab {...{ me, meRec, caps, token, onSignOut: signOut, flash }} />}
 
         <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: "#fff", borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: `repeat(${isGuest ? 2 : 6},1fr)`, height: 66, zIndex: 20 }}>
           {(isGuest
             ? [["book", "Book", Calendar], ["me", "You", User]]
             : [["log", "Log", ClipboardList], ["inv", "Inventory", Boxes], ["ord", "Orders", ShoppingCart], ["book", "Book", Calendar], ["rep", "Reports", BarChart3], ["set", "Manage", Settings]]
           ).map(([k, label, Icon]) => {
-            const badge = k === "ord" ? pendingFor(orders, me, caps) : 0;
+            const badge = k === "ord" ? pendingFor(orders, me, caps) : k === "book" ? accessQueue.length : 0;
             return (<button key={k} onClick={() => setTab(k)} style={{ position: "relative", background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, color: view === k ? T.accent : T.muted }}>
               <Icon size={19} />{badge > 0 && <span style={{ position: "absolute", top: 6, right: "50%", marginRight: -18, background: T.danger, color: "#fff", fontSize: 9.5, fontWeight: 700, borderRadius: 999, minWidth: 15, height: 15, display: "grid", placeItems: "center", padding: "0 3px" }}>{badge}</span>}<span style={{ fontSize: 9.5, fontWeight: 600 }}>{label}</span>
             </button>);
@@ -282,7 +337,8 @@ function UsageEdit({ u, onSave, onClose }) {
 }
 
 /* ---------- INVENTORY ---------- */
-function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, onDelete, onRequest }) {
+function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, onDelete, onBulkPar, onRequest }) {
+  const [parPanel, setParPanel] = useState(false);
   const [q, setQ] = useState(""); const [filter, setFilter] = useState("All"); const [edit, setEdit] = useState(null); const [view, setView] = useState(null);
   const filtered = inv.filter((i) => {
     if (q && !(i.name + " " + i.vendor + " " + i.catalog + " " + i.box + " " + (i.lot || "") + " " + (i.assayGroup || "") + " " + (i.applications || "") + " " + (i.clone || "")).toLowerCase().includes(q.toLowerCase())) return false;
@@ -290,6 +346,7 @@ function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, 
     if (filter === "Project kits") return i.scope === "Project";
     if (filter === "Needs info") return incomplete(i);
     if (filter === "Low stock") return lowStock(i);
+    if (filter === "Duplicates") return false; // handled by its own view below
     if (cats.includes(filter)) return i.category === filter;
     return true;
   });
@@ -302,7 +359,11 @@ function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, 
   };
   const missingCount = inv.filter(incomplete).length;
   const low = inv.filter(lowStock);
-  const chips = ["All", ...(low.length ? ["Low stock"] : []), "General store", "Project kits", ...(missingCount ? ["Needs info"] : []), ...cats];
+  const hasPar = (i) => !(i.minQty === "" || i.minQty == null || isNaN(+i.minQty));
+  const noPar = inv.filter((i) => !hasPar(i)).length;
+  const dupGroups = findDuplicates(inv);
+  const dupCount = dupGroups.reduce((n, g) => n + g.length - 1, 0);
+  const chips = ["All", ...(low.length ? ["Low stock"] : []), ...(canEdit && dupCount ? ["Duplicates"] : []), "General store", "Project kits", ...(missingCount ? ["Needs info"] : []), ...cats];
   return (
     <div style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
@@ -319,6 +380,19 @@ function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, 
           <TrendingDown size={17} color={T.amber} style={{ flexShrink: 0 }} />
           <span style={{ fontSize: 13, color: T.amber, fontWeight: 600 }}>{low.length} item{low.length === 1 ? "" : "s"} at or below par level — tap to review</span>
         </button>)}
+
+      {canEdit && noPar > 0 && (
+        <div style={{ background: "#fff", border: `1px solid ${T.border}`, borderRadius: 12, padding: "12px 13px", margin: "4px 0 10px" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 9 }}>
+            <AlertTriangle size={16} color={T.amber} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{noPar} items have no par level</div>
+              <div style={{ fontSize: 12, color: T.muted, marginTop: 2, lineHeight: 1.45 }}>Without one, an item only shows as low when it hits zero. Set a threshold per category and the restocking alerts start working.</div>
+              <button onClick={() => setParPanel((v) => !v)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", padding: 0, marginTop: 7 }}>{parPanel ? "Hide" : "Set par levels"}</button>
+            </div>
+          </div>
+          {parPanel && <ParLevelPanel inv={inv} cats={cats} onBulkPar={onBulkPar} />}
+        </div>)}
       {!canEdit && <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: T.muted, margin: "4px 0 10px" }}><Lock size={13} />View only — tap an item for details. Editing is limited to program directors.</div>}
       {groups.map(([cat, arr]) => (
         <div key={cat} style={{ marginTop: 16 }}>
@@ -327,19 +401,114 @@ function InvTab({ me, inv, cats, projects, pdNames, canEdit, isGuest, onUpsert, 
             <button key={i.id} onClick={() => canEdit ? setEdit(i) : setView(i)} style={{ ...rowBtn, alignItems: "flex-start" }}>
               <div style={{ minWidth: 0, textAlign: "left" }}><div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.name}</div>
                 <div style={{ fontSize: 11.5, color: T.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}><MapPin size={12} />{locLine(i)}{i.scope === "Project" && <span style={{ color: "#127449", fontWeight: 600 }}>· {i.project}</span>}{incomplete(i) && <span style={{ display: "inline-flex", alignItems: "center", gap: 3, color: T.amber, fontWeight: 600 }}><AlertTriangle size={11} />needs info</span>}</div></div>
-              <div style={{ textAlign: "right", flexShrink: 0, paddingLeft: 8 }}>{i.qty !== "" && i.qty != null && <div style={{ fontSize: 13, fontWeight: 700, color: lowStock(i) ? T.amber : T.ink }}>{i.qty}{i.unit ? " " + i.unit : ""}</div>}{i.minQty ? <div style={{ fontSize: 10.5, color: T.muted, marginTop: 1 }}>par {i.minQty}</div> : null}{i.box && <div style={{ fontSize: 11, color: T.muted, fontFamily: "ui-monospace, Menlo, monospace", marginTop: 2 }}>{i.box}</div>}</div>
+              <div style={{ textAlign: "right", flexShrink: 0, paddingLeft: 8 }}>{i.qty !== "" && i.qty != null && <div style={{ fontSize: 13, fontWeight: 700, color: lowStock(i) ? T.amber : T.ink }}>{i.qty}{i.unit ? " " + i.unit : ""}</div>}{i.aliquots && +i.aliquots > 0 ? <div style={{ fontSize: 10.5, color: T.muted, marginTop: 1 }}>+{i.aliquots} aliquots</div> : null}{i.minQty ? <div style={{ fontSize: 10.5, color: T.muted, marginTop: 1 }}>par {i.minQty}</div> : null}{i.box && <div style={{ fontSize: 11, color: T.muted, fontFamily: "ui-monospace, Menlo, monospace", marginTop: 2 }}>{i.box}</div>}</div>
             </button>))}
           {arr.length > cap && <div style={{ fontSize: 12, color: T.muted, padding: "4px 2px 2px" }}>+{arr.length - cap} more — search or pick this category to see all.</div>}
         </div>))}
-      {filtered.length === 0 && <EmptyNote>No items match.</EmptyNote>}
+      {filter === "Duplicates" && <DuplicatesView groups={dupGroups} onOpen={(i) => setEdit(i)} onDelete={onDelete} />}
+      {filter !== "Duplicates" && filtered.length === 0 && <EmptyNote>No items match.</EmptyNote>}
       {edit && <ItemForm item={edit.new ? null : edit} cats={cats} projects={projects} pdNames={pdNames} onRequest={!edit.new && me && !isGuest ? () => { onRequest(edit); setEdit(null); } : null} onSave={(it) => { onUpsert(it); setEdit(null); }} onDelete={(id) => { onDelete(id); setEdit(null); }} onClose={() => setEdit(null)} />}
       {view && <ItemForm item={view} cats={cats} projects={projects} pdNames={pdNames} readOnly onRequest={me && !isGuest ? () => { onRequest(view); setView(null); } : null} onClose={() => setView(null)} />}
     </div>
   );
 }
 
+/* Two records for one tube on the shelf. Groups by catalog number first, then
+   by name + vendor, and leaves the judgement to a person — nothing is merged
+   or removed automatically. */
+function findDuplicates(inv) {
+  const norm = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const byCat = new Map();
+  const byNv = new Map();
+  for (const i of inv) {
+    const c = norm(i.catalog);
+    if (c.length >= 3) {
+      if (!byCat.has(c)) byCat.set(c, []);
+      byCat.get(c).push(i);
+    } else {
+      const k = norm(i.name) + "|" + norm(i.vendor);
+      if (norm(i.name).length < 3) continue;
+      if (!byNv.has(k)) byNv.set(k, []);
+      byNv.get(k).push(i);
+    }
+  }
+  const groups = [...byCat.values(), ...byNv.values()].filter((g) => g.length > 1);
+  groups.sort((a, b) => b.length - a.length || String(a[0].name).localeCompare(String(b[0].name)));
+  return groups;
+}
+
+const itemLabel = (i) => (i.name || "").trim() || [i.catalog, i.vendor].filter(Boolean).join(" · ") || "Unnamed item";
+
+function DuplicatesView({ groups, onOpen, onDelete }) {
+  if (groups.length === 0) return <EmptyNote>No duplicates found.</EmptyNote>;
+  const total = groups.reduce((n, g) => n + g.length - 1, 0);
+  // Name the set by its fullest entry — these sets usually differ only by a
+  // typo or an abbreviation of the same antibody.
+  const setName = (g) => g.map(itemLabel).sort((a, b) => b.length - a.length)[0];
+  return (<div>
+    <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, color: T.amber, background: "#FDF0DF", border: `1px solid ${T.amber}33`, borderRadius: 12, padding: "11px 13px", marginBottom: 14, lineHeight: 1.45 }}>
+      <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+      <div><b>{groups.length} sets look like the same item</b> — {total} record{total === 1 ? "" : "s"} could go. Check the location and quantity before removing one; two entries can be two genuine tubes in different boxes.</div>
+    </div>
+    {groups.map((g, gi) => (
+      <div key={gi} style={{ background: "#fff", border: `1px solid ${T.line}`, borderRadius: 12, padding: 12, marginBottom: 10 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 2 }}>{setName(g)}</div>
+        <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 9 }}>{[g[0].vendor, g[0].catalog].filter(Boolean).join(" · ")} — {g.length} records</div>
+        {g.map((i) => (
+          <div key={i.id} style={{ display: "flex", alignItems: "center", gap: 9, borderTop: `1px solid ${T.line}`, padding: "9px 0 0", marginTop: 8 }}>
+            <button onClick={() => onOpen(i)} style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{itemLabel(i)}</div>
+              <div style={{ fontSize: 11.5, color: T.muted, marginTop: 2 }}>
+                {i.qty !== "" && i.qty != null ? `${i.qty} ${i.unit || ""}` : "no quantity"}
+                {i.aliquots && +i.aliquots > 0 ? ` · +${i.aliquots} aliquots` : ""} · {locLine(i)}
+              </div>
+            </button>
+            <button onClick={() => { if (window.confirm(`Delete this record?\n\n${itemLabel(i)}\n${i.qty !== "" ? i.qty + " " + (i.unit || "") : "no quantity"} at ${locLine(i)}\n\nThe other ${g.length - 1} record${g.length - 1 === 1 ? "" : "s"} in this set stay.`)) onDelete(i.id); }}
+              style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5, background: "#fff", border: `1px solid ${T.danger}44`, color: T.danger, borderRadius: 9, padding: "7px 10px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+              <Trash2 size={14} />Delete
+            </button>
+          </div>
+        ))}
+      </div>
+    ))}
+  </div>);
+}
+
+/* Par levels are what make the restocking alerts mean anything. Setting 1,500
+   of them by hand is not going to happen, so set them a category at a time. */
+function ParLevelPanel({ inv, cats, onBulkPar }) {
+  const [cat, setCat] = useState(cats[0] || "");
+  const [val, setVal] = useState("1");
+  const [onlyMissing, setOnlyMissing] = useState(true);
+  const hasPar = (i) => !(i.minQty === "" || i.minQty == null || isNaN(+i.minQty));
+  const inCat = cat === "*" ? inv : inv.filter((i) => i.category === cat);
+  const affected = onlyMissing ? inCat.filter((i) => !hasPar(i)).length : inCat.length;
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.line}` }}>
+      <Field label="Category">
+        <Select value={cat} onChange={(e) => setCat(e.target.value)}>
+          {cats.map((c) => {
+            const n = inv.filter((i) => i.category === c && !hasPar(i)).length;
+            return <option key={c} value={c}>{c}{n ? ` — ${n} without a par level` : ""}</option>;
+          })}
+          <option value="*">Everything</option>
+        </Select>
+      </Field>
+      <Field label="Reorder when stock drops to"><Input inputMode="decimal" value={val} onChange={(e) => setVal(e.target.value)} /></Field>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 12, cursor: "pointer" }}>
+        <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)} style={{ width: 16, height: 16 }} />
+        Only items that don&apos;t have one yet
+      </label>
+      <Btn onClick={() => { if (val.trim() && !isNaN(+val)) onBulkPar(cat, val.trim(), onlyMissing); }} style={{ opacity: affected > 0 && val.trim() && !isNaN(+val) ? 1 : .5 }}>
+        <TrendingDown size={16} />Apply to {affected} item{affected === 1 ? "" : "s"}
+      </Btn>
+      <div style={{ fontSize: 11.5, color: T.muted, marginTop: 8, lineHeight: 1.5 }}>You can still change any single item&apos;s par level by opening it.</div>
+    </div>
+  );
+}
+
 function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, onRequest, onClose }) {
-  const [f, setF] = useState(item || { id: uid(), name: "", category: cats[0], scope: "General", project: "", leader: "", room: "", fridge: "", box: "", catalog: "", vendor: "", qty: "", unit: "", notes: "", lot: "", assayGroup: "", host: "", clonality: "", clone: "", isotype: "", reactivity: "", applications: "", owner: "", received: "", minQty: "" });
+  const [f, setF] = useState(item || { id: uid(), name: "", category: cats[0], scope: "General", project: "", leader: "", room: "", fridge: "", box: "", catalog: "", vendor: "", qty: "", unit: "", notes: "", lot: "", assayGroup: "", host: "", clonality: "", clone: "", isotype: "", reactivity: "", applications: "", owner: "", received: "", minQty: "", aliquots: "" });
   const isAb = ANTIBODY_CATS.includes(f.category);
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const onProject = (name) => { const p = projects.find((x) => x.name === name); setF((s) => ({ ...s, project: name, leader: p && p.leader ? p.leader : s.leader })); };
@@ -347,7 +516,7 @@ function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, o
   if (readOnly) return (<Sheet title={f.name} onClose={onClose}>
     {lowStock(f) && <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "9px 12px", marginBottom: 14 }}><TrendingDown size={15} />At or below par level{f.minQty ? ` (par ${f.minQty})` : ""} — worth reordering.</div>}
     <Static label="Category" value={[f.category, f.assayGroup].filter(Boolean).join(" · ")} /><Static label="Belongs to" value={f.scope === "Project" ? `${f.project}${f.leader ? " · " + shortName(f.leader) : ""}` : "General inventory"} />
-    <Static label="Location" value={locLine(f)} /><Static label="Quantity" value={f.qty !== "" ? `${f.qty} ${f.unit}` : ""} /><Static label="Par level" value={f.minQty} />
+    <Static label="Location" value={locLine(f)} /><Static label="Quantity" value={f.qty !== "" ? `${f.qty} ${f.unit}` : ""} /><Static label="Aliquots" value={f.aliquots && +f.aliquots > 0 ? String(f.aliquots) : ""} /><Static label="Par level" value={f.minQty} />
     <Static label="Catalog #" value={f.catalog} /><Static label="Vendor" value={f.vendor} /><Static label="Lot #" value={f.lot} />
     {isAb && <><Static label="Host / clonality" value={[f.host, f.clonality === "M" ? "monoclonal" : f.clonality === "P" ? "polyclonal" : f.clonality].filter(Boolean).join(" · ")} />
       <Static label="Clone #" value={f.clone} /><Static label="Isotype" value={f.isotype} /><Static label="Reactivity" value={f.reactivity} /><Static label="Validated for" value={f.applications} /></>}
@@ -367,6 +536,8 @@ function ItemForm({ item, cats, projects, pdNames, readOnly, onSave, onDelete, o
       <Field label="Unit"><UnitInput value={f.unit} onChange={(e) => set("unit", e.target.value)} /></Field>
       <Field label="Par level"><Input value={f.minQty || ""} onChange={(e) => set("minQty", e.target.value)} placeholder="2" inputMode="decimal" /></Field>
     </div>
+    {isAb && <Field label="Aliquots on hand"><Input value={f.aliquots || ""} onChange={(e) => set("aliquots", e.target.value)} placeholder="0" inputMode="decimal" /></Field>}
+    {isAb && <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>Vials and aliquots are counted separately. An item with no vials left but aliquots in the box does not show as out of stock.</div>}
     <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>Par level is the reorder threshold. At or below it the item shows as low stock and joins the monthly restocking list.</div>
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Catalog #"><Input value={f.catalog} onChange={(e) => set("catalog", e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field><Field label="Vendor"><Input value={f.vendor} onChange={(e) => set("vendor", e.target.value)} /></Field></div>
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Lot #"><Input value={f.lot || ""} onChange={(e) => set("lot", e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field><Field label="Kept by"><Input value={f.owner || ""} onChange={(e) => set("owner", e.target.value)} placeholder="e.g. Pilar" /></Field></div>
@@ -438,43 +609,81 @@ function RepTab({ usage, memberNames }) {
 }
 
 /* ---------- MANAGE ---------- */
-function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, onAddMember, onDelMember, onToggleAdmin, onSetRole, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat }) {
+function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember, onDelMember, onToggleAdmin, onSetRole, onSetOwner, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat, onReload, flash }) {
   const [nm, setNm] = useState(""); const [nmEmail, setNmEmail] = useState(""); const [nmRole, setNmRole] = useState("member");
+  const resetPin = async (name) => {
+    if (!window.confirm(`Clear ${shortName(name)}'s PIN? They will choose a new one next time they sign in, and any device they are signed in on is signed out.`)) return;
+    try {
+      const r = await fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json", "x-session": token }, body: JSON.stringify({ action: "resetPin", target: name, token }) });
+      const d = await r.json();
+      flash(d.ok ? "PIN cleared" : (d.error || "Couldn't reset that PIN"));
+      onReload();
+    } catch { flash("Can't reach the server"); }
+  };
   const [pn, setPn] = useState(""); const [pl, setPl] = useState(pdNames[0] || ""); const [nc, setNc] = useState(""); const [editP, setEditP] = useState(null);
-  if (!canEdit) return (<div style={{ padding: 18 }}>
+  if (!canEdit && !caps.access) return (<div style={{ padding: 18 }}>
     <SectionTitle icon={Settings}>Manage</SectionTitle>
-    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: T.muted, background: "#fff", border: `1px solid ${T.border}`, borderRadius: 12, padding: 14, marginBottom: 16 }}><Lock size={16} />You have logging access. Inventory and roster edits are limited to program directors and full-access staff.</div>
-    <Card title={`Lab roster · ${members.length}`}>{members.map((m) => <div key={m.name} style={rowFlat}><span style={{ fontSize: 14 }}>{m.name}</span>{m.role === "admin" && <span style={{ fontSize: 11, fontWeight: 700, color: T.accent }}>{m.pd ? "PD" : "FULL"}</span>}</div>)}</Card>
+    <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, color: T.muted, background: "#fff", border: `1px solid ${T.border}`, borderRadius: 12, padding: 14, marginBottom: 16, lineHeight: 1.45 }}><Lock size={16} style={{ flexShrink: 0, marginTop: 1 }} />You can view the inventory, log usage, request orders and book instruments. Editing inventory and changing roles is limited.</div>
+    <Card title={`Lab roster · ${members.length}`}>{members.map((m) => <div key={m.name} style={{ ...rowFlat, marginBottom: 6 }}><span style={{ fontSize: 14 }}>{m.name}</span>{(m.pd || m.role === "chair" || m.role === "admin") && <span style={{ fontSize: 11, fontWeight: 700, color: T.accent }}>{m.role === "chair" ? "CHAIR" : m.pd ? "PD" : "FULL"}</span>}</div>)}</Card>
   </div>);
   return (
     <div style={{ padding: 18 }}>
       <SectionTitle icon={Settings}>Manage</SectionTitle>
-      <Card title={`Lab members · ${members.length}`}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 12 }}>{members.map((m) => (
-          <div key={m.name} style={rowFlat}>
-            <div style={{ minWidth: 0 }}><div style={{ fontSize: 14, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>{m.email && <div style={{ fontSize: 11, color: T.muted }}>{m.email}</div>}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+      {caps.access ? <Card title={`Access control · ${members.length} people`}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, color: T.accentInk, background: "#E6F3F4", borderRadius: 10, padding: "10px 12px", marginBottom: 14, lineHeight: 1.45 }}>
+          <Shield size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div>You decide who is in the app and what each person can do. Everyone signed in can already view inventory, request an order and book instruments — the settings below only add to that.</div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 9, marginBottom: 16 }}>{members.map((m) => (
+          <div key={m.name} style={{ border: `1px solid ${m.owner ? T.accent : T.line}`, background: "#fff", borderRadius: 11, padding: "11px 12px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                {m.email && <div style={{ fontSize: 11, color: T.muted }}>{m.email}</div>}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: m.hasPin ? "#127449" : T.amber, background: m.hasPin ? "#EAF6EE" : "#FDF0DF", borderRadius: 999, padding: "3px 7px" }}>{m.hasPin ? "PIN SET" : "NO PIN"}</span>
+                {m.hasPin && <button onClick={() => resetPin(m.name)} style={{ background: "none", border: "none", color: T.accent, fontSize: 11.5, fontWeight: 600, cursor: "pointer", padding: 0 }}>Reset</button>}
+                {!m.pd && <button onClick={() => { if (window.confirm(`Remove ${shortName(m.name)} from the lab roster?`)) onDelMember(m.name); }} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>}
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 7, marginTop: 9 }}>
               {m.pd || m.role === "chair"
-                ? <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent, border: `1px solid ${T.accent}`, background: "#E6F3F4", borderRadius: 999, padding: "3px 8px" }}>{m.role === "chair" ? "CHAIR" : "PD"}</span>
-                : <Select value={m.role || "member"} onChange={(e) => onSetRole(m.name, e.target.value)} style={{ height: 32, fontSize: 11.5, fontWeight: 700, padding: "0 8px", width: 122 }}>
-                    <option value="member">Log &amp; view</option>
-                    <option value="admin">Full access</option>
-                    <option value="purchasing">Purchasing (Megan)</option>
-                    <option value="guest">Booking only</option>
+                ? <div style={{ fontSize: 11.5, color: T.muted, display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 10, fontWeight: 700, color: T.accent, border: `1px solid ${T.accent}`, background: "#E6F3F4", borderRadius: 999, padding: "2px 7px" }}>{m.role === "chair" ? "CHAIR" : "PD"}</span>Approves orders and assigns funding</div>
+                : <Select value={m.role || "member"} onChange={(e) => onSetRole(m.name, e.target.value)} style={{ height: 36, fontSize: 12.5 }}>
+                    <option value="member">Lab member — log, view, request, book</option>
+                    <option value="purchasing">Purchasing — also places orders and records receipt</option>
+                    <option value="admin">Full access — also edits inventory and instruments</option>
+                    <option value="guest">Booking only — outside collaborator</option>
                   </Select>}
-              {!m.pd && <button onClick={() => onDelMember(m.name)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>}</div>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer", color: m.owner ? T.accentInk : T.ink }}>
+                <input type="checkbox" checked={!!m.owner} onChange={(e) => onSetOwner(m.name, e.target.checked)} style={{ width: 16, height: 16 }} />
+                <span style={{ display: "flex", alignItems: "center", gap: 5 }}><Shield size={13} color={m.owner ? T.accent : T.muted} />Can grant access to others</span>
+              </label>
+            </div>
           </div>))}</div>
-        <Field label="Add member — name"><Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="Last, First" /></Field>
+
+        <div style={{ fontSize: 11.5, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 8 }}>ADD SOMEONE</div>
+        <Field label="Name"><Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="Last, First" /></Field>
         <Field label="Email"><Input value={nmEmail} onChange={(e) => setNmEmail(e.target.value)} placeholder="netid@utmb.edu" /></Field>
         <Field label="Access"><Select value={nmRole} onChange={(e) => setNmRole(e.target.value)}>
-          <option value="member">Log &amp; view — lab member</option>
-          <option value="admin">Full access — edit inventory, take in and place orders</option>
-          <option value="purchasing">Purchasing — receives requests and routes them to a PI</option>
+          <option value="member">Lab member — log, view, request, book</option>
+          <option value="purchasing">Purchasing — also places orders and records receipt</option>
+          <option value="admin">Full access — also edits inventory and instruments</option>
           <option value="guest">Booking only — outside collaborator</option>
         </Select></Field>
-        <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 12, lineHeight: 1.5 }}>Booking-only is for people outside the lab who need instrument time (for example the group using the ultracentrifuge). They see the Book tab and nothing else.</div>
+        <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 12, lineHeight: 1.5 }}>They choose their own PIN the first time they sign in. You never see it — only clear it.</div>
         <Btn onClick={() => { if (nm.trim()) { onAddMember({ name: nm.trim(), email: nmEmail.trim(), role: nmRole }); setNm(""); setNmEmail(""); setNmRole("member"); } }} style={{ opacity: nm.trim() ? 1 : .5 }}>Add member</Btn>
       </Card>
+      : <Card title={`Lab roster · ${members.length}`}>
+          <div style={{ fontSize: 12, color: T.muted, marginBottom: 10, lineHeight: 1.45 }}>Roles and sign-in are managed by {members.filter((m) => m.owner).map((m) => shortName(m.name)).join(" or ") || "the lab"}.</div>
+          {members.map((m) => (
+            <div key={m.name} style={{ ...rowFlat, marginBottom: 6 }}>
+              <span style={{ fontSize: 13.5, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
+              <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent, flexShrink: 0 }}>{m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : m.role === "purchasing" ? "PURCHASING" : m.role === "guest" ? "BOOK" : ""}</span>
+            </div>))}
+        </Card>}
+
       <Card title={`Projects & leaders · ${projects.length}`}>
         <div style={{ fontSize: 12, color: T.muted, marginBottom: 10 }}>Project kits are stored with — and accountable to — their program director.</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 12 }}>{projects.map((p) => (<div key={p.id} style={rowFlat}><span style={{ minWidth: 0 }}><span style={{ fontSize: 14, fontWeight: 600 }}>{p.name}</span>{p.leader && <span style={{ fontSize: 12, color: T.muted }}> · {shortName(p.leader)}</span>}</span><span style={{ display: "flex", gap: 4, flexShrink: 0 }}><button onClick={() => setEditP(p)} title="Edit" style={iconBtn}><Pencil size={15} color={T.muted} /></button><button onClick={() => { if (window.confirm(`Delete project "${p.name}"?`)) onDelProject(p.id); }} style={iconBtn}><Trash2 size={15} color={T.muted} /></button></span></div>))}</div>
@@ -507,28 +716,210 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdi
 }
 
 /* ---------- ME ---------- */
-function MeTab({ me, members, pickMe, setTab }) {
+/* ---------- sign in ---------- */
+/* Before v7 you picked a name off a list and became that person. Now every
+   account has its own PIN, set by its owner, and the server decides what you
+   may do from the session rather than from anything the browser claims. */
+function LoginGate({ onSignedIn }) {
+  const [roster, setRoster] = useState(null);
   const [q, setQ] = useState("");
-  const list = members.filter((m) => m.name.toLowerCase().includes(q.toLowerCase()));
-  const chair = list.filter((m) => m.role === "chair");
-  const pds = list.filter((m) => m.pd);
-  const full = list.filter((m) => m.role === "admin" && !m.pd);
-  const purch = list.filter((m) => m.role === "purchasing");
-  const rest = list.filter((m) => !["chair", "admin", "guest", "purchasing"].includes(m.role) && !m.pd);
-  const guests = list.filter((m) => m.role === "guest");
-  const badgeOf = (m) => m.role === "chair" ? "CHAIR" : m.pd ? "PD" : m.role === "admin" ? "FULL" : m.role === "purchasing" ? "BUY" : m.role === "guest" ? "BOOK" : null;
-  const Row = (m) => (<button key={m.name} onClick={() => { pickMe(m.name); setTab("log"); }} style={{ ...rowFlat, cursor: "pointer", border: `1px solid ${me === m.name ? T.accent : T.border}`, background: me === m.name ? "#E6F3F4" : "#fff", marginBottom: 7 }}><span style={{ fontSize: 14.5, fontWeight: 600 }}>{m.name}</span>{me === m.name ? <Check size={18} color={T.accent} /> : badgeOf(m) ? <span style={{ fontSize: 10.5, fontWeight: 700, color: T.accent }}>{badgeOf(m)}</span> : null}</button>);
-  const Group = (title, arr) => arr.length ? <div style={{ marginBottom: 14 }}><div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, letterSpacing: ".04em", marginBottom: 8 }}>{title}</div>{arr.map(Row)}</div> : null;
+  const [picked, setPicked] = useState(null);
+  const [pin, setPin] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [shared, setShared] = useState(false);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/auth?names=1", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d) => setRoster(d.members || []))
+      .catch(() => setRoster([]));
+  }, []);
+
+  const call = async (payload) => {
+    setBusy(true); setErr("");
+    try {
+      const r = await fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const d = await r.json();
+      setBusy(false);
+      if (!d.ok) { setErr(d.error || "That didn't work."); return null; }
+      return d;
+    } catch { setBusy(false); setErr("Can't reach the server."); return null; }
+  };
+
+  const doLogin = async () => {
+    const d = await call({ action: "login", name: picked.name, pin, shared });
+    if (d && d.token) onSignedIn(d.token);
+  };
+  const doSetup = async () => {
+    if (pin !== pin2) { setErr("The two PINs don't match."); return; }
+    const d = await call({ action: "setPin", name: picked.name, pin, shared });
+    if (d && d.token) onSignedIn(d.token);
+  };
+
+  const wrap = (children) => (
+    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", background: T.bg, minHeight: "100vh", color: T.ink }}>
+      <div style={{ maxWidth: 420, margin: "0 auto", padding: "40px 18px 60px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 26 }}>
+          <div style={{ width: 42, height: 42, borderRadius: 11, background: T.accent, display: "grid", placeItems: "center", color: "#fff" }}><FlaskConical size={22} /></div>
+          <div><div style={{ fontSize: 19, fontWeight: 800, letterSpacing: "-.01em", lineHeight: 1 }}>Menon Lab</div><div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}>Inventory &amp; ordering</div></div>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+
+  if (roster === null) return wrap(<div style={{ color: T.muted, fontSize: 14 }}>Loading…</div>);
+
+  if (!picked) {
+    const list = roster.filter((m) => m.name.toLowerCase().includes(q.toLowerCase()));
+    return wrap(<>
+      <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 3 }}>Sign in</div>
+      <div style={{ fontSize: 13, color: T.muted, marginBottom: 16, lineHeight: 1.5 }}>Find your name, then enter your PIN. Everything you log, book or approve is recorded under your account.</div>
+      <div style={{ position: "relative", marginBottom: 14 }}>
+        <Search size={17} color={T.muted} style={{ position: "absolute", left: 12, top: 14 }} />
+        <Input autoFocus placeholder="Your name…" value={q} onChange={(e) => setQ(e.target.value)} style={{ paddingLeft: 38 }} />
+      </div>
+      {list.slice(0, 40).map((m) => (
+        <button key={m.name} onClick={() => { setPicked(m); setPin(""); setPin2(""); setErr(""); }}
+          style={{ ...rowFlat, width: "100%", cursor: "pointer", marginBottom: 7, textAlign: "left" }}>
+          <span style={{ fontSize: 14.5, fontWeight: 600 }}>{m.name}</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
+            {!m.hasPin && <span style={{ fontSize: 10, fontWeight: 700, color: T.amber, background: "#FDF0DF", borderRadius: 999, padding: "3px 7px" }}>SET PIN</span>}
+            <ChevronRight size={17} color={T.muted} />
+          </span>
+        </button>
+      ))}
+      {list.length === 0 && <EmptyNote>No name matches &quot;{q}&quot;. Ask an admin to add you to the roster.</EmptyNote>}
+    </>);
+  }
+
+  const setup = !picked.hasPin;
+  const canGo = setup ? (pin.length >= 4 && pin2.length >= 4) : pin.length >= 4;
+  return wrap(<>
+    <button onClick={() => { setPicked(null); setErr(""); }} style={{ display: "flex", alignItems: "center", gap: 4, background: "none", border: "none", color: T.accent, fontSize: 13, fontWeight: 600, cursor: "pointer", padding: 0, marginBottom: 16 }}><ChevronLeft size={16} />Not you?</button>
+    <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 3 }}>{picked.name}</div>
+    <div style={{ fontSize: 13, color: T.muted, marginBottom: 18, lineHeight: 1.5 }}>
+      {setup ? "First time in. Choose a PIN of 4 to 6 digits — you'll use it every time, and nobody else can sign in as you without it." : "Enter your PIN."}
+    </div>
+    <Field label={setup ? "Choose a PIN" : "PIN"}>
+      <Input autoFocus type="password" inputMode="numeric" maxLength={6} value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
+        onKeyDown={(e) => { if (e.key === "Enter" && !setup && canGo) doLogin(); }}
+        style={{ letterSpacing: "0.5em", fontSize: 20, textAlign: "center" }} />
+    </Field>
+    {setup && <Field label="Type it again">
+      <Input type="password" inputMode="numeric" maxLength={6} value={pin2}
+        onChange={(e) => setPin2(e.target.value.replace(/\D/g, ""))}
+        onKeyDown={(e) => { if (e.key === "Enter" && canGo) doSetup(); }}
+        style={{ letterSpacing: "0.5em", fontSize: 20, textAlign: "center" }} />
+    </Field>}
+    <label style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: 13, marginBottom: 16, cursor: "pointer", color: T.ink }}>
+      <input type="checkbox" checked={shared} onChange={(e) => setShared(e.target.checked)} style={{ width: 17, height: 17, marginTop: 1, flexShrink: 0 }} />
+      <span>This is a shared lab computer<span style={{ display: "block", fontSize: 11.5, color: T.muted, marginTop: 2 }}>Signs you out after 15 minutes idle, so the next person isn&apos;t you.</span></span>
+    </label>
+    {err && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.danger, background: "#FDECEC", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}><AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />{err}</div>}
+    <Btn onClick={setup ? doSetup : doLogin} style={{ opacity: canGo && !busy ? 1 : .5 }}><Lock size={16} />{busy ? "…" : setup ? "Set PIN and sign in" : "Sign in"}</Btn>
+    {!setup && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 10, lineHeight: 1.5 }}>Forgotten it? The chair or any full-access member can reset your PIN from Manage.</div>}
+  </>);
+}
+
+/* A standing reminder of what is waiting on you, for people who don't get
+   UTMB email alerts. */
+function PendingBanner({ orders, me, caps, accessQueue, view, onOrders, onAccess }) {
+  const n = pendingFor(orders, me, caps);
+  const a = accessQueue.length;
+  if (view === "ord" && a === 0) return null;
+  if (n === 0 && a === 0) return null;
+  const parts = [];
+  if (n > 0) parts.push({ n, label: n === 1 ? "order needs you" : "orders need you", go: onOrders });
+  if (a > 0) parts.push({ n: a, label: a === 1 ? "access request" : "access requests", go: onAccess });
+  return (
+    <div style={{ margin: "14px 18px 0", display: "flex", flexDirection: "column", gap: 7 }}>
+      {parts.map((p) => (
+        <button key={p.label} onClick={p.go} style={{ display: "flex", alignItems: "center", gap: 9, width: "100%", textAlign: "left", background: "#FDF0DF", border: "1px solid #F0D9B5", borderRadius: 12, padding: "11px 13px", cursor: "pointer" }}>
+          <span style={{ width: 26, height: 26, borderRadius: 999, background: T.amber, color: "#fff", display: "grid", placeItems: "center", fontSize: 12.5, fontWeight: 800, flexShrink: 0 }}>{p.n}</span>
+          <span style={{ fontSize: 13.5, fontWeight: 600, color: "#7A4A06", flex: 1 }}>{p.label}</span>
+          <ChevronRight size={17} color={T.amber} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- your account ---------- */
+function MeTab({ me, meRec, caps, token, onSignOut, flash }) {
+  const [oldPin, setOldPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [newPin2, setNewPin2] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notifState, setNotifState] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
+
+  const roleLabel = meRec.role === "chair" ? "Chair" : meRec.pd ? "Program director" : meRec.role === "admin" ? "Full access" : meRec.role === "purchasing" ? "Purchasing" : meRec.role === "guest" ? "Booking only" : "Lab member";
+  const allowed = [
+    caps.approve && "Approve orders and assign funding",
+    caps.place && "Place orders and record receipt",
+    caps.grants && "Set grants and budgets",
+    caps.edit && "Edit inventory and instruments",
+    caps.access && "Decide who is on the roster and what each person can do",
+    caps.guest ? "Book instruments" : "Log usage, request orders, view inventory, book instruments",
+  ].filter(Boolean);
+
+  const change = async () => {
+    setErr("");
+    if (newPin !== newPin2) { setErr("The two new PINs don't match."); return; }
+    setBusy(true);
+    try {
+      const r = await fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json", "x-session": token }, body: JSON.stringify({ action: "changePin", oldPin, newPin, token }) });
+      const d = await r.json();
+      setBusy(false);
+      if (!d.ok) { setErr(d.error || "That didn't work."); return; }
+      setOldPin(""); setNewPin(""); setNewPin2(""); flash("PIN changed");
+    } catch { setBusy(false); setErr("Can't reach the server."); }
+  };
+
+  const askNotif = async () => {
+    try { const p = await Notification.requestPermission(); setNotifState(p); } catch {}
+  };
+
   return (<div style={{ padding: 18 }}>
-    <SectionTitle icon={User}>Your identity</SectionTitle>
-    <div style={{ fontSize: 13, color: T.muted, marginBottom: 12 }}>Usage you log is attributed to this name.</div>
-    <div style={{ position: "relative", marginBottom: 14 }}><Search size={17} color={T.muted} style={{ position: "absolute", left: 12, top: 14 }} /><Input placeholder="Find your name…" value={q} onChange={(e) => setQ(e.target.value)} style={{ paddingLeft: 38 }} /></div>
-    {Group("CHAIR", chair)}{Group("PROGRAM DIRECTORS", pds)}{Group("FULL ACCESS", full)}{Group("PURCHASING", purch)}{Group("LAB MEMBERS", rest)}{Group("BOOKING ONLY", guests)}
-    {list.length === 0 && <EmptyNote>No name matches "{q}".</EmptyNote>}
+    <SectionTitle icon={User}>Your account</SectionTitle>
+    <Card title="SIGNED IN AS">
+      <div style={{ fontSize: 16, fontWeight: 700 }}>{me}</div>
+      <div style={{ fontSize: 12.5, color: T.accent, fontWeight: 600, marginTop: 3 }}>{roleLabel}</div>
+      {meRec.email && <div style={{ fontSize: 12.5, color: T.muted, marginTop: 3 }}>{meRec.email}</div>}
+      <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.line}` }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, color: T.muted, marginBottom: 7 }}>YOU CAN</div>
+        {allowed.map((a) => <div key={a} style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.ink, marginBottom: 5 }}><Check size={14} color={T.accent} style={{ flexShrink: 0, marginTop: 2 }} />{a}</div>)}
+      </div>
+    </Card>
+
+    <Card title="ALERTS ON THIS DEVICE">
+      <div style={{ fontSize: 12.5, color: T.muted, lineHeight: 1.5, marginBottom: notifState === "granted" ? 0 : 12 }}>
+        {notifState === "granted"
+          ? "Browser alerts are on. You'll be notified when an order needs you or yours moves along, even with the app in another tab."
+          : notifState === "denied"
+            ? "Browser alerts are blocked for this site. Turn them back on in your browser's site settings if you want them."
+            : "Turn on browser alerts so approvals reach you without relying on UTMB email."}
+      </div>
+      {notifState === "default" && <Btn kind="ghost" onClick={askNotif}><Bell size={16} />Turn on browser alerts</Btn>}
+    </Card>
+
+    <Card title="CHANGE YOUR PIN">
+      <Field label="Current PIN"><Input type="password" inputMode="numeric" maxLength={6} value={oldPin} onChange={(e) => setOldPin(e.target.value.replace(/\D/g, ""))} /></Field>
+      <Field label="New PIN (4-6 digits)"><Input type="password" inputMode="numeric" maxLength={6} value={newPin} onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ""))} /></Field>
+      <Field label="New PIN again"><Input type="password" inputMode="numeric" maxLength={6} value={newPin2} onChange={(e) => setNewPin2(e.target.value.replace(/\D/g, ""))} /></Field>
+      {err && <div style={{ fontSize: 12.5, color: T.danger, marginBottom: 12 }}>{err}</div>}
+      <Btn onClick={change} style={{ opacity: oldPin.length >= 4 && newPin.length >= 4 && !busy ? 1 : .5 }}><Lock size={16} />Change PIN</Btn>
+      <div style={{ fontSize: 11.5, color: T.muted, marginTop: 8, lineHeight: 1.5 }}>Changing your PIN signs you out everywhere else.</div>
+    </Card>
+
+    <Btn kind="danger" onClick={onSignOut}><X size={16} />Log out</Btn>
   </div>);
 }
 
-/* ---------- shared ---------- */
 const SectionTitle = ({ icon: Icon, children, noMargin }) => (<div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: noMargin ? 0 : 14 }}><Icon size={20} color={T.accent} /><h1 style={{ fontSize: 19, fontWeight: 800, letterSpacing: "-.01em", margin: 0 }}>{children}</h1></div>);
 const Card = ({ title, children }) => (<div style={{ background: "#fff", border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, marginBottom: 16 }}><div style={{ fontSize: 13, fontWeight: 800, letterSpacing: ".02em", marginBottom: 12 }}>{title}</div>{children}</div>);
 const EmptyNote = ({ children }) => <div style={{ fontSize: 13, color: T.muted, background: "#fff", border: `1px dashed ${T.border}`, borderRadius: 12, padding: 16, lineHeight: 1.5, marginTop: 10 }}>{children}</div>;
@@ -543,26 +934,34 @@ function incomplete(i) { return !((i.vendor || "").trim()) || !((i.catalog || ""
 function shortName(n) { return n.includes(",") ? n.split(",")[0].trim() : n.split(" ")[0]; }
 
 /* ---------- ORDERS / PURCHASING ---------- */
-const ORDER_STATUS = { requested: ["Awaiting review", "#B45309"], routed: ["Awaiting approval", "#6D3BB5"], approved: ["Ready to order", "#1D4ED8"], ordered: ["Ordered", "#0E7C86"], received: ["Received", "#127449"], rejected: ["Sent back", "#B42318"] };
+const ORDER_STATUS = { requested: ["Awaiting PI approval", "#6D3BB5"], routed: ["Awaiting PI approval", "#6D3BB5"], approved: ["Ready to order", "#1D4ED8"], ordered: ["Ordered", "#0E7C86"], received: ["Received", "#127449"], rejected: ["Sent back", "#B42318"] };
 const money = (n) => "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Requester -> PI -> purchasing. An order waiting on approval belongs to the
+// PI it was addressed to, not to whoever happens to be an admin.
+const awaitingMe = (o, me, caps) => {
+  if (o.status === "requested" || o.status === "routed") return caps.approve && (o.approver === me || !o.approver);
+  if (o.status === "approved" || o.status === "ordered") return caps.place;
+  return false;
+};
 function pendingFor(orders, me, caps) {
   if (!me) return 0;
-  return orders.filter((o) => (o.status === "requested" && caps.intake) || (o.status === "routed" && caps.approve) || ((o.status === "approved" || o.status === "ordered") && caps.place)).length;
+  return orders.filter((o) => awaitingMe(o, me, caps)).length;
 }
 const committedFor = (orders, gid) => orders.filter((o) => o.grantId === gid && (o.status === "ordered" || o.status === "received")).reduce((s, o) => s + (Number(o.total) || 0), 0);
 
-function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
+function OrdersTab({ me, caps, token, orders, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
   const [nw, setNw] = useState(false);
   useEffect(() => { if (orderSeed) setNw(true); }, [orderSeed]);
   const [editO, setEditO] = useState(null);
   const [view, setView] = useState("act");
   const [receiving, setReceiving] = useState(null);
-  const [routing, setRouting] = useState(null);
+  const [approving, setApproving] = useState(null);
+  const [reassigning, setReassigning] = useState(null);
   const [showGrants, setShowGrants] = useState(false);
 
   const mine = orders.filter((o) => o.requester === me);
-  const toAct = orders.filter((o) => (o.status === "requested" && caps.intake) || (o.status === "routed" && caps.approve) || ((o.status === "approved" || o.status === "ordered") && caps.place));
-  const anyRole = caps.intake || caps.approve || caps.place || caps.grants;
+  const toAct = orders.filter((o) => awaitingMe(o, me, caps));
+  const anyRole = caps.approve || caps.place || caps.grants;
   const shown = view === "mine" ? mine : view === "all" ? orders : toAct;
 
   const exportToOrder = () => {
@@ -571,7 +970,7 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
   };
   // The full monthly pack (supply list, restocking, spend, fund availability)
   // is generated server-side so it can also be bookmarked or scheduled.
-  const monthlyPack = () => { window.location.href = "/api/monthly"; };
+  const monthlyPack = () => { window.location.href = "/api/monthly?token=" + encodeURIComponent(token || ""); };
   const exportMonthly = () => {
     const now = new Date(), m0 = new Date(now.getFullYear(), now.getMonth(), 1);
     const rows = orders.filter((o) => new Date(o.createdAt) >= m0).map((o) => ({ Date: fmtDate(o.createdAt), Item: o.itemName, Qty: o.qty, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, Status: (ORDER_STATUS[o.status] || [o.status])[0], Reason: o.experiment }));
@@ -628,34 +1027,28 @@ function OrdersTab({ me, caps, orders, grants, projects, inv, members, approverN
       )}
 
       {shown.length === 0 ? <EmptyNote>{view === "act" ? "Nothing needs your action right now." : view === "mine" ? "You haven't requested anything yet." : "No orders yet."}</EmptyNote>
-        : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onRoute={() => setRouting(o)} onEdit={() => setEditO(o)} />)}
+        : shown.map((o) => <OrderCard key={o.id} o={o} me={me} caps={caps} grants={grants} orders={orders} inv={inv} onAction={onAction} onDelete={onDelete} onReceive={() => setReceiving(o)} onApprove={() => setApproving(o)} onReassign={() => setReassigning(o)} onEdit={() => setEditO(o)} />)}
 
-      {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} grants={grants} inv={inv} approvers={approverNames} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
-      {editO && <OrderForm me={me} projects={projects} grants={grants} inv={inv} approvers={approverNames} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
-      {routing && <RouteSheet o={routing} approvers={approverNames} onConfirm={(approver) => { onAction(routing.id, "route", { approver }); setRouting(null); }} onClose={() => setRouting(null)} />}
+      {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} approvers={approverNames} inv={inv} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
+      {editO && <OrderForm me={me} projects={projects} approvers={approverNames} inv={inv} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
+      {approving && <ApproveSheet o={approving} grants={grants} orders={orders} onConfirm={(x) => { onAction(approving.id, "approve", x); setApproving(null); }} onClose={() => setApproving(null)} />}
+      {reassigning && <ReassignSheet o={reassigning} approvers={approverNames} onConfirm={(approver) => { onAction(reassigning.id, "reassign", { approver }); setReassigning(null); }} onClose={() => setReassigning(null)} />}
       {receiving && <ReceiveSheet o={receiving} onConfirm={(addItem) => { onAction(receiving.id, "receive", { addItem }); setReceiving(null); }} onClose={() => setReceiving(null)} />}
     </div>
   );
 }
 
-function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onReceive, onRoute, onEdit }) {
+function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onReceive, onApprove, onReassign, onEdit }) {
   const [st, color] = ORDER_STATUS[o.status] || [o.status, T.muted];
   const dup = inv.find((i) => i.name.toLowerCase().trim() === (o.itemName || "").toLowerCase().trim());
   const grant = grants.find((g) => g.id === o.grantId);
   const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
-  const insufficient = grant && grant.budget > 0 && remaining < o.total;
+  const waiting = o.status === "requested" || o.status === "routed";
+  const mineToApprove = waiting && caps.approve && (o.approver === me || !o.approver);
   const reject = () => { const r = window.prompt("Reason for sending back?") || ""; onAction(o.id, "reject", { reason: r }); };
   const place = () => { const po = window.prompt("PO / order reference (optional):") || ""; onAction(o.id, "place", { po }); };
-  // Dr. Menon's rule: the FRS is assigned at the moment of final approval,
-  // together with the fund position the approver was looking at.
-  const approveWithFrs = () => {
-    const frs = window.prompt(`FRS / account to charge${grant ? " for " + grant.name : ""}:`, o.frs || "");
-    if (frs === null) return;
-    const fundNote = grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "";
-    onAction(o.id, "approve", { frs: frs.trim(), fundNote });
-  };
   return (
-    <div style={{ background: "#fff", border: `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
+    <div style={{ background: "#fff", border: `1px solid ${mineToApprove ? "#D8CBEE" : T.line}`, borderLeft: mineToApprove ? "3px solid #6D3BB5" : `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
         <div style={{ minWidth: 0 }}><div style={{ fontSize: 14.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.itemName}</div>
           <div style={{ fontSize: 11.5, color: T.muted, marginTop: 2 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div></div>
@@ -666,30 +1059,27 @@ function OrderCard({ o, me, caps, grants, orders, inv, onAction, onDelete, onRec
         {o.grantName && <span>· {o.grantName}</span>}{o.project && <span>· {o.project}</span>}<span>· {shortName(o.requester || "")}</span>
       </div>
       {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
-      {o.status === "requested" && o.requestedApprover && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>For approval by:</b> {shortName(o.requestedApprover)}</div>}
-      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.piApprover ? ` · assigned by ${shortName(o.piApprover)}` : ""}</div>}
+      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.piApprover ? ` · assigned by ${shortName(o.piApprover)}` : ""}{o.approvedVia === "whatsapp" ? " · via WhatsApp" : ""}</div>}
       {o.explored && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}><b style={{ color: T.ink, fontWeight: 600 }}>Explored:</b> {o.explored}</div>}
       {o.checklist && Object.keys(o.checklist).length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#127449", background: "#EAF6EE", borderRadius: 8, padding: "5px 9px", marginTop: 8, width: "fit-content" }}>
           <ListChecks size={13} />Pre-order checklist completed ({Object.values(o.checklist).filter(Boolean).length}/7)
         </div>
       )}
-      {o.status === "routed" && o.approver && <div style={{ fontSize: 11.5, color: "#6D3BB5", marginTop: 6 }}>Sent to {shortName(o.approver)} for approval by {shortName(o.authorizer || "")}</div>}
-      {dup && o.status === "requested" && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: T.amber, background: "#FDF0DF", borderRadius: 8, padding: "6px 9px", marginTop: 8 }}><AlertTriangle size={14} />Already in lab: {dup.qty || "in stock"} at {locLine(dup)}. Cross-check first.</div>}
-      {o.status === "routed" && caps.approve && grant && grant.budget > 0 && <div style={{ fontSize: 11.5, color: insufficient ? T.danger : T.muted, marginTop: 8 }}>{grant.name}: {money(remaining)} available {insufficient ? "— exceeds remaining budget" : ""}</div>}
+      {waiting && o.approver && <div style={{ fontSize: 11.5, color: "#6D3BB5", marginTop: 6 }}>With {shortName(o.approver)} for approval and funding</div>}
+      {dup && waiting && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: T.amber, background: "#FDF0DF", borderRadius: 8, padding: "6px 9px", marginTop: 8 }}><AlertTriangle size={14} />Already in lab: {dup.qty || "in stock"} at {locLine(dup)}. Cross-check first.</div>}
+      {grant && grant.budget > 0 && <div style={{ fontSize: 11.5, color: remaining < o.total ? T.danger : T.muted, marginTop: 8 }}>{grant.name}: {money(remaining)} available{remaining < o.total ? " — exceeds remaining budget" : ""}</div>}
       {o.rejectReason && o.status === "rejected" && <div style={{ fontSize: 12, color: T.danger, marginTop: 6 }}>Sent back: {o.rejectReason}</div>}
 
       <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-        {o.status === "requested" && caps.intake && <>
-          <ActBtn onClick={onRoute} icon={Send}>Route for approval</ActBtn>
-          <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
-        {o.status === "routed" && caps.approve && <>
-          <ActBtn onClick={approveWithFrs} icon={CheckCircle2}>Approve + assign FRS</ActBtn>
-          <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
+        {mineToApprove && <>
+          <ActBtn onClick={onApprove} icon={CheckCircle2}>Approve + assign funding</ActBtn>
+          <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn>
+          <ActBtn kind="ghost" onClick={onReassign} icon={Send}>Pass to another PI</ActBtn></>}
         {o.status === "approved" && caps.place && <ActBtn onClick={place} icon={ShoppingCart}>Place order</ActBtn>}
         {o.status === "ordered" && caps.place && <ActBtn onClick={onReceive} icon={PackageCheck}>Mark received</ActBtn>}
-        {(o.requester === me || caps.intake) && o.status === "requested" && <ActBtn kind="ghost" onClick={onEdit} icon={Pencil}>Edit</ActBtn>}
-        {((o.requester === me && (o.status === "requested" || o.status === "rejected")) || (caps.intake && o.status !== "received")) && <ActBtn kind="ghost" onClick={() => { if (window.confirm("Cancel and delete this order request?")) onDelete(o.id); }} icon={Trash2}>{o.requester === me ? "Delete" : "Cancel"}</ActBtn>}
+        {o.requester === me && waiting && <ActBtn kind="ghost" onClick={onEdit} icon={Pencil}>Edit</ActBtn>}
+        {((o.requester === me && (waiting || o.status === "rejected")) || (caps.place && o.status !== "received")) && <ActBtn kind="ghost" onClick={() => { if (window.confirm("Cancel and delete this order request?")) onDelete(o.id); }} icon={Trash2}>{o.requester === me ? "Delete" : "Cancel"}</ActBtn>}
       </div>
     </div>
   );
@@ -706,9 +1096,11 @@ const CHECKLIST = [
   ["price", "I compared vendor pricing or have a quote"],
 ];
 
-function OrderForm({ me, projects, grants, inv, approvers, existing, seed, onSave, onClose }) {
+function OrderForm({ me, projects, approvers, inv, existing, seed, onSave, onClose }) {
   const isEdit = !!existing;
-  const [f, setF] = useState(existing ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", grantId: existing.grantId || "", grantName: existing.grantName || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "", requestedApprover: existing.requestedApprover || "" } : { id: uid(), itemName: seed ? seed.name : "", catalog: seed ? seed.catalog || "" : "", vendor: seed ? seed.vendor || "" : "", qty: "1", unitPrice: "", project: seed && seed.scope === "Project" ? seed.project : "", grantId: "", grantName: "", experiment: "", notes: "", dupAck: !!seed, explored: seed ? `Raised from the inventory record: ${seed.qty !== "" && seed.qty != null ? seed.qty + " " + (seed.unit || "") : "no quantity recorded"} at ${locLine(seed)}.` : "", fromItemId: seed ? seed.id : "", requestedApprover: "" });
+  const [f, setF] = useState(existing
+    ? { id: existing.id, itemName: existing.itemName || "", catalog: existing.catalog || "", vendor: existing.vendor || "", qty: (existing.qty ?? "") + "", unitPrice: (existing.unitPrice ?? "") + "", project: existing.project || "", approver: existing.approver || "", experiment: existing.experiment || "", notes: existing.notes || "", dupAck: true, explored: existing.explored || "" }
+    : { id: uid(), itemName: seed ? seed.name : "", catalog: seed ? seed.catalog || "" : "", vendor: seed ? seed.vendor || "" : "", qty: "1", unitPrice: "", project: seed && seed.scope === "Project" ? seed.project : "", approver: approvers[0] || "", experiment: "", notes: "", dupAck: !!seed, explored: seed ? `Raised from the inventory record: ${seed.qty !== "" && seed.qty != null ? seed.qty + " " + (seed.unit || "") : "no quantity recorded"} at ${locLine(seed)}.` : "", fromItemId: seed ? seed.id : "" });
   const [ck, setCk] = useState({});
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const toggle = (k) => setCk((s) => ({ ...s, [k]: !s[k] }));
@@ -716,9 +1108,8 @@ function OrderForm({ me, projects, grants, inv, approvers, existing, seed, onSav
   const total = (parseFloat(f.qty) || 0) * (parseFloat(f.unitPrice) || 0);
   const ckDone = isEdit || CHECKLIST.every((c) => ck[c[0]]);
   const ckCount = CHECKLIST.filter((c) => ck[c[0]]).length;
-  const ok = f.itemName.trim() && f.experiment.trim() && f.requestedApprover && ckDone && (!dup || f.dupAck);
-  const submit = () => { if (!ok) return; const g = grants.find((x) => x.id === f.grantId); onSave({ ...f, total, unitPrice: parseFloat(f.unitPrice) || 0, grantName: g ? g.name : "", ...(isEdit ? {} : { checklist: ck }) }); };
-  const seedGrant = grants.find((x) => x.id === f.grantId);
+  const ok = f.itemName.trim() && f.experiment.trim() && f.approver && ckDone && (!dup || f.dupAck);
+  const submit = () => { if (!ok) return; onSave({ ...f, total, unitPrice: parseFloat(f.unitPrice) || 0, ...(isEdit ? {} : { checklist: ck }) }); };
   return (
     <Sheet title={isEdit ? "Edit request" : "Request an order"} onClose={onClose}>
       {seed && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.accentInk, background: "#E6F3F4", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
@@ -730,14 +1121,16 @@ function OrderForm({ me, projects, grants, inv, approvers, existing, seed, onSav
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><Field label="Quantity"><Input inputMode="decimal" value={f.qty} onChange={(e) => set("qty", e.target.value)} /></Field><Field label="Unit price ($)"><Input inputMode="decimal" value={f.unitPrice} onChange={(e) => set("unitPrice", e.target.value)} placeholder="0.00" /></Field></div>
       <div style={{ fontSize: 13, color: T.muted, marginTop: -4, marginBottom: 14 }}>Estimated total: <b style={{ color: T.ink }}>{money(total)}</b></div>
       <Field label="Project"><Select value={f.project} onChange={(e) => set("project", e.target.value)}><option value="">—</option>{projects.map((p) => <option key={p.id}>{p.name}</option>)}</Select></Field>
+
       <Field label="Send to which PI for approval? *">
-        <Select value={f.requestedApprover} onChange={(e) => set("requestedApprover", e.target.value)}>
-          <option value="">Select the PI who should approve…</option>
-          {(approvers || []).map((n) => <option key={n}>{n}</option>)}
+        <Select value={f.approver} onChange={(e) => set("approver", e.target.value)}>
+          <option value="">—</option>{approvers.map((n) => <option key={n}>{n}</option>)}
         </Select>
       </Field>
-      <div style={{ fontSize: 11.5, color: T.muted, marginTop: -8, marginBottom: 14, lineHeight: 1.5 }}>Your request goes to Megan, who sends it to this person for the FRS / grant.</div>
-      <Field label="Grant / fund"><Select value={f.grantId} onChange={(e) => set("grantId", e.target.value)}><option value="">—</option>{grants.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}</Select></Field>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14, lineHeight: 1.45 }}>
+        <DollarSign size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The PI chooses the grant and FRS when they approve. You don&apos;t pick the funding account.</div>
+      </div>
+
       <Field label="Reason — experiment / justification *"><Input value={f.experiment} onChange={(e) => set("experiment", e.target.value)} placeholder="What is it for? e.g. P-gp WB, Aim 2" /></Field>
 
       {!isEdit && <div style={{ background: ckDone ? "#EAF6EE" : "#F6F8F9", border: `1px solid ${ckDone ? "#BFE3CC" : T.border}`, borderRadius: 12, padding: 14, marginBottom: 14 }}>
@@ -755,8 +1148,9 @@ function OrderForm({ me, projects, grants, inv, approvers, existing, seed, onSav
       </div>}
       <Field label="What did you find? (options you explored)"><Input value={f.explored} onChange={(e) => set("explored", e.target.value)} placeholder="e.g. only 1 vial left, expired 2024; no equivalent clone" /></Field>
       <Field label="Notes (optional)"><Input value={f.notes} onChange={(e) => set("notes", e.target.value)} placeholder="link, size, lot…" /></Field>
-      <Btn onClick={submit} style={{ opacity: ok ? 1 : .5 }}><Send size={16} />{isEdit ? "Save changes" : "Send request"}</Btn>
+      <Btn onClick={submit} style={{ opacity: ok ? 1 : .5 }}><Send size={16} />{isEdit ? "Save changes" : "Send for approval"}</Btn>
       {!ckDone && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>Complete the checklist to submit.</div>}
+      {ckDone && !f.approver && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>Choose which PI should approve.</div>}
     </Sheet>
   );
 }
@@ -790,20 +1184,63 @@ function NotifSheet({ notifs, onSeen, onSeenAll, onGo, onClose }) {
   );
 }
 
-function RouteSheet({ o, approvers, onConfirm, onClose }) {
-  // Pre-selected to whoever the requester named, so Megan is confirming
-  // rather than guessing. She can still change it.
-  const [who, setWho] = useState(o.requestedApprover || approvers[0] || "");
-  return (<Sheet title="Route for approval" onClose={onClose}>
+/* The PI picks the grant and the FRS here. This is the single point where a
+   funding account is attached to a purchase. */
+function ApproveSheet({ o, grants, orders, onConfirm, onClose }) {
+  const [grantId, setGrantId] = useState(o.grantId || (grants[0] ? grants[0].id : ""));
+  const [frs, setFrs] = useState(o.frs || "");
+  const grant = grants.find((g) => g.id === grantId);
+  const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
+  const over = grant && grant.budget > 0 && remaining < o.total;
+  const ok = frs.trim().length > 0;
+  const go = () => {
+    if (!ok) return;
+    onConfirm({
+      frs: frs.trim(),
+      grantId: grant ? grant.id : "",
+      grantName: grant ? grant.name : "",
+      fundNote: grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "",
+    });
+  };
+  return (<Sheet title="Approve and assign funding" onClose={onClose}>
+    <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
+    <div style={{ fontSize: 20, fontWeight: 800, color: T.ink, marginBottom: 4 }}>{money(o.total)}</div>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 16 }}>Requested by {shortName(o.requester || "")}{o.project ? ` · ${o.project}` : ""}</div>
+    {o.experiment && <div style={{ fontSize: 12.5, color: T.ink, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 16, lineHeight: 1.45 }}><b>Reason:</b> {o.experiment}</div>}
+
+    <Field label="Charge to which grant?">
+      <Select value={grantId} onChange={(e) => setGrantId(e.target.value)}>
+        <option value="">— no grant —</option>
+        {grants.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+      </Select>
+    </Field>
+    {grant && grant.budget > 0 && (
+      <div style={{ fontSize: 12.5, color: over ? T.danger : T.muted, background: over ? "#FDECEC" : "#F6F8F9", border: `1px solid ${over ? "#F3C9C9" : T.border}`, borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14 }}>
+        {grant.name}: <b style={{ color: over ? T.danger : T.ink }}>{money(remaining)}</b> of {money(grant.budget)} remaining.
+        {over ? " This purchase exceeds what's left." : ` After this, ${money(remaining - o.total)}.`}
+      </div>
+    )}
+    {grants.length === 0 && <div style={{ fontSize: 12.5, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14 }}>No grants set up yet. Add them under Orders → Manage grants &amp; budgets.</div>}
+
+    <Field label="FRS / account number *">
+      <Input value={frs} onChange={(e) => setFrs(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
+    </Field>
+    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 16, lineHeight: 1.5 }}>Recorded on the order along with the fund position at the moment you approve, so the charge can be traced later.</div>
+    <Btn onClick={go} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Approve and send to purchasing</Btn>
+    {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>An FRS account is required.</div>}
+  </Sheet>);
+}
+
+function ReassignSheet({ o, approvers, onConfirm, onClose }) {
+  const [who, setWho] = useState(approvers.find((n) => n !== o.approver) || "");
+  return (<Sheet title="Pass to another PI" onClose={onClose}>
     <div style={{ fontSize: 14, marginBottom: 4, fontWeight: 600 }}>{o.itemName}</div>
     <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 16 }}>{[o.qty && `×${o.qty}`, money(o.total), o.requester && "from " + shortName(o.requester)].filter(Boolean).join(" · ")}</div>
-    {o.requestedApprover && <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, color: T.accentInk, background: "#E6F3F4", borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
-      <User size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The requester designated <b>{o.requestedApprover}</b> for the FRS / grant.</div></div>}
-    <Field label="Send to for final approval">
-      <Select value={who} onChange={(e) => setWho(e.target.value)}>{approvers.map((n) => <option key={n}>{n}</option>)}</Select>
+    <Field label="Send to">
+      <Select value={who} onChange={(e) => setWho(e.target.value)}><option value="">—</option>{approvers.map((n) => <option key={n}>{n}</option>)}</Select>
     </Field>
-    <div style={{ fontSize: 12, color: T.muted, marginBottom: 14 }}>Final approval and the FRS must come from the Chair or a program director.</div>
-    <Btn onClick={() => who && onConfirm(who)} style={{ opacity: who ? 1 : .5 }}><Send size={16} />Send for approval</Btn>
+    <Btn onClick={() => who && onConfirm(who)} style={{ opacity: who ? 1 : .5 }}><Send size={16} />Pass it on</Btn>
   </Sheet>);
 }
 
@@ -876,61 +1313,188 @@ const INSTR_COLORS = ["#0E7C86", "#6D3BB5", "#B45309", "#127449", "#1D4ED8", "#B
 const bookingConflicts = (bookings, instrumentId, day, sMin, eMin, ignoreId) =>
   bookings.filter((b) => b.instrumentId === instrumentId && b.day === day && b.id !== ignoreId && sMin < b.endMin && b.startMin < eMin);
 
-function BookTab({ me, canEdit, instruments, bookings, onBook, onCancel, onUpsertInstrument, onDelInstrument }) {
+const monthKey = (d) => new Date(d).toISOString().slice(0, 7);
+const monthLabel = (k) => new Date(k + "-01T00:00:00").toLocaleDateString(undefined, { month: "long", year: "numeric" });
+const bookingHours = (b) => Math.max(0, b.endMin - b.startMin) / 60;
+
+function BookTab({ me, canEdit, instruments, bookings, memberNames, myAccess, accessQueue, onBook, onCancel, onUpsertInstrument, onDelInstrument, onRequestAccess, onDecideAccess }) {
   const [day, setDay] = useState(new Date());
   const [filter, setFilter] = useState("all");
   const [form, setForm] = useState(false);
   const [manage, setManage] = useState(false);
+  const [mode, setMode] = useState("schedule");
+  const [asking, setAsking] = useState(null);
   const dayStr = isoDate(day);
   const colorOf = (id) => INSTR_COLORS[Math.max(0, instruments.findIndex((x) => x.id === id)) % INSTR_COLORS.length];
   const todays = bookings.filter((b) => b.day === dayStr && (filter === "all" || b.instrumentId === filter)).sort((a, b) => a.startMin - b.startMin);
   const groups = instruments.filter((i) => filter === "all" || i.id === filter).map((i) => [i, todays.filter((b) => b.instrumentId === i.id)]);
   const isToday = isoDate(new Date()) === dayStr;
 
+  const accessOf = (insId) => (myAccess.find((a) => a.instrumentId === insId) || {}).status || "";
+  const mayBook = (ins) => !ins.restricted || canEdit || ins.superUser === me || accessOf(ins.id) === "granted";
+  const bookable = instruments.filter(mayBook);
+
   return (
     <div style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <SectionTitle icon={Calendar} noMargin>Instruments</SectionTitle>
-        {me && <button onClick={() => setForm(true)} style={{ display: "flex", alignItems: "center", gap: 5, background: T.accent, color: "#fff", border: "none", borderRadius: 10, padding: "9px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}><Plus size={16} />Book</button>}
+        {mode === "schedule" && <button onClick={() => setForm(true)} style={{ display: "flex", alignItems: "center", gap: 5, background: T.accent, color: "#fff", border: "none", borderRadius: 10, padding: "9px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}><Plus size={16} />Book</button>}
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", border: `1px solid ${T.border}`, borderRadius: 12, padding: "8px 10px", marginBottom: 12 }}>
-        <button onClick={() => setDay(addDays(day, -1))} style={navBtn}><ChevronLeft size={20} /></button>
-        <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{new Date(day).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</div>
-          {!isToday && <button onClick={() => setDay(new Date())} style={{ background: "none", border: "none", color: T.accent, fontSize: 11.5, fontWeight: 600, cursor: "pointer", marginTop: 1 }}>Today</button>}
-          {isToday && <div style={{ fontSize: 11, color: T.accent, fontWeight: 600 }}>Today</div>}
-        </div>
-        <button onClick={() => setDay(addDays(day, 1))} style={navBtn}><ChevronRight size={20} /></button>
-      </div>
-
-      <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 6, marginBottom: 8 }}>
-        {[["all", "All"], ...instruments.map((i) => [i.id, i.name])].map(([k, label]) => (
-          <button key={k} onClick={() => setFilter(k)} style={{ flexShrink: 0, border: `1px solid ${filter === k ? T.accent : T.border}`, background: filter === k ? T.accent : "#fff", color: filter === k ? "#fff" : T.ink, borderRadius: 999, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
+      <div style={{ display: "flex", gap: 7, marginBottom: 14 }}>
+        {[["schedule", "Schedule"], ["usage", "Usage log"]].map(([k, label]) => (
+          <button key={k} onClick={() => setMode(k)} style={{ flex: 1, border: `1px solid ${mode === k ? T.accent : T.border}`, background: mode === k ? T.accent : "#fff", color: mode === k ? "#fff" : T.ink, borderRadius: 10, padding: "8px 6px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
 
-      {canEdit && <button onClick={() => setManage((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", margin: "4px 0 12px", display: "flex", alignItems: "center", gap: 5 }}><Settings size={14} />{manage ? "Hide instrument setup" : "Manage instruments"}</button>}
-      {manage && canEdit && <InstrumentsPanel instruments={instruments} onUpsert={onUpsertInstrument} onDel={onDelInstrument} />}
+      {accessQueue.length > 0 && (
+        <Card title={`ACCESS REQUESTS · ${accessQueue.length}`}>
+          <div style={{ fontSize: 12, color: T.muted, marginBottom: 10, lineHeight: 1.45 }}>People asking to be signed off on kit you look after. Grant it once they&apos;ve been trained.</div>
+          {accessQueue.map((a) => (
+            <div key={a.id} style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700 }}>{shortName(a.member)} → {a.instrumentName}</div>
+              {a.note && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}>{a.note}</div>}
+              <div style={{ fontSize: 11, color: T.muted, marginTop: 3 }}>Asked {fmtDate(a.requestedAt)}</div>
+              <div style={{ display: "flex", gap: 8, marginTop: 9 }}>
+                <ActBtn onClick={() => onDecideAccess(a.id, "granted")} icon={Check}>Grant</ActBtn>
+                <ActBtn kind="ghost" onClick={() => onDecideAccess(a.id, "revoked")} icon={X}>Decline</ActBtn>
+              </div>
+            </div>
+          ))}
+        </Card>
+      )}
 
-      {groups.map(([ins, list]) => (
-        <div key={ins.id} style={{ marginTop: 14 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}><span style={{ width: 9, height: 9, borderRadius: 999, background: colorOf(ins.id) }} /><span style={{ fontSize: 13, fontWeight: 800 }}>{ins.name}</span><span style={{ fontSize: 11.5, color: T.muted }}>· {list.length ? `${list.length} booked` : "free"}</span></div>
-          {list.length === 0 && <div style={{ fontSize: 12.5, color: T.muted, padding: "2px 2px 4px" }}>No bookings — open all day.</div>}
-          {list.map((b) => (
-            <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1px solid ${T.line}`, borderLeft: `3px solid ${colorOf(ins.id)}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7 }}>
-              <div style={{ minWidth: 78, fontSize: 12.5, fontWeight: 700, color: T.ink }}>{minLabel(b.startMin)}<div style={{ fontSize: 11, color: T.muted, fontWeight: 500 }}>{minLabel(b.endMin)}</div></div>
-              <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 13.5, fontWeight: 600 }}>{shortName(b.member)}</div>{b.purpose && <div style={{ fontSize: 12, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.purpose}</div>}</div>
-              {(b.member === me || canEdit) && <button onClick={() => onCancel(b.id)} style={iconBtn}><X size={17} color={T.muted} /></button>}
+      {mode === "usage" ? (
+        <InstrumentUsageLog instruments={instruments} bookings={bookings} />
+      ) : (<>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", border: `1px solid ${T.border}`, borderRadius: 12, padding: "8px 10px", marginBottom: 12 }}>
+          <button onClick={() => setDay(addDays(day, -1))} style={navBtn}><ChevronLeft size={20} /></button>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>{new Date(day).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</div>
+            {!isToday && <button onClick={() => setDay(new Date())} style={{ background: "none", border: "none", color: T.accent, fontSize: 11.5, fontWeight: 600, cursor: "pointer", marginTop: 1 }}>Today</button>}
+            {isToday && <div style={{ fontSize: 11, color: T.accent, fontWeight: 600 }}>Today</div>}
+          </div>
+          <button onClick={() => setDay(addDays(day, 1))} style={navBtn}><ChevronRight size={20} /></button>
+        </div>
+
+        <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 6, marginBottom: 8 }}>
+          {[["all", "All"], ...instruments.map((i) => [i.id, i.name])].map(([k, label]) => (
+            <button key={k} onClick={() => setFilter(k)} style={{ flexShrink: 0, border: `1px solid ${filter === k ? T.accent : T.border}`, background: filter === k ? T.accent : "#fff", color: filter === k ? "#fff" : T.ink, borderRadius: 999, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
+          ))}
+        </div>
+
+        {canEdit && <button onClick={() => setManage((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", margin: "4px 0 12px", display: "flex", alignItems: "center", gap: 5 }}><Settings size={14} />{manage ? "Hide instrument setup" : "Manage instruments"}</button>}
+        {manage && canEdit && <InstrumentsPanel instruments={instruments} memberNames={memberNames} onUpsert={onUpsertInstrument} onDel={onDelInstrument} />}
+
+        {groups.map(([ins, list]) => {
+          const st = accessOf(ins.id);
+          const locked = ins.restricted && !mayBook(ins);
+          return (
+            <div key={ins.id} style={{ marginTop: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                <span style={{ width: 9, height: 9, borderRadius: 999, background: colorOf(ins.id) }} />
+                <span style={{ fontSize: 13, fontWeight: 800 }}>{ins.name}</span>
+                {ins.restricted && <span style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 10, fontWeight: 700, color: locked ? T.amber : "#127449", background: locked ? "#FDF0DF" : "#EAF6EE", borderRadius: 999, padding: "2px 7px" }}><Lock size={10} />{locked ? "TRAINING NEEDED" : "SIGNED OFF"}</span>}
+                <span style={{ fontSize: 11.5, color: T.muted }}>· {list.length ? `${list.length} booked` : "free"}</span>
+              </div>
+              {ins.superUser && <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 7, display: "flex", alignItems: "center", gap: 5 }}><Shield size={12} color={T.accent} />Super user: {shortName(ins.superUser)}</div>}
+              {locked && (
+                st === "requested"
+                  ? <div style={{ fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "9px 11px", marginBottom: 8 }}>Access requested — waiting on {ins.superUser ? shortName(ins.superUser) : "the super user"}.</div>
+                  : <button onClick={() => setAsking(ins)} style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${T.accent}`, color: T.accent, borderRadius: 9, padding: "7px 11px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginBottom: 8 }}><Lock size={13} />{st === "revoked" ? "Ask again" : "Request access"}</button>
+              )}
+              {list.length === 0 && <div style={{ fontSize: 12.5, color: T.muted, padding: "2px 2px 4px" }}>No bookings — open all day.</div>}
+              {list.map((b) => (
+                <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1px solid ${T.line}`, borderLeft: `3px solid ${colorOf(ins.id)}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7 }}>
+                  <div style={{ minWidth: 78, fontSize: 12.5, fontWeight: 700, color: T.ink }}>{minLabel(b.startMin)}<div style={{ fontSize: 11, color: T.muted, fontWeight: 500 }}>{minLabel(b.endMin)}</div></div>
+                  <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 13.5, fontWeight: 600 }}>{shortName(b.member)}</div>{b.purpose && <div style={{ fontSize: 12, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.purpose}</div>}</div>
+                  {(b.member === me || canEdit) && <button onClick={() => onCancel(b.id)} style={iconBtn}><X size={17} color={T.muted} /></button>}
+                </div>
+              ))}
+            </div>
+          );
+        })}
+        {instruments.length === 0 && <EmptyNote>No instruments yet.{canEdit ? " Add some above." : ""}</EmptyNote>}
+      </>)}
+
+      {form && <BookingForm me={me} instruments={bookable} bookings={bookings} day={dayStr} preselect={filter !== "all" && bookable.some((i) => i.id === filter) ? filter : ""} onSave={(b) => { onBook(b); setForm(false); }} onClose={() => setForm(false)} />}
+      {asking && <AccessRequestSheet ins={asking} onConfirm={(note) => { onRequestAccess(asking.id, note); setAsking(null); }} onClose={() => setAsking(null)} />}
+    </div>
+  );
+}
+
+/* How much each machine was actually used, month by month — the record
+   Dr. Menon asked for. */
+function InstrumentUsageLog({ instruments, bookings }) {
+  const [m, setM] = useState(monthKey(new Date()));
+  const months = [...new Set(bookings.map((b) => monthKey(b.day + "T00:00:00")))].sort().reverse();
+  const opts = months.includes(m) ? months : [m, ...months];
+  const inMonth = bookings.filter((b) => monthKey(b.day + "T00:00:00") === m);
+
+  const rows = instruments.map((ins) => {
+    const list = inMonth.filter((b) => b.instrumentId === ins.id);
+    const people = [...new Set(list.map((b) => b.member))];
+    const hrs = list.reduce((t, b) => t + bookingHours(b), 0);
+    const byPerson = people.map((p) => ({
+      name: p,
+      sessions: list.filter((b) => b.member === p).length,
+      hours: list.filter((b) => b.member === p).reduce((t, b) => t + bookingHours(b), 0),
+    })).sort((a, b) => b.hours - a.hours);
+    return { ins, sessions: list.length, people: people.length, hours: hrs, byPerson };
+  }).sort((a, b) => b.sessions - a.sessions);
+
+  const totalSessions = rows.reduce((t, r) => t + r.sessions, 0);
+  const totalHours = rows.reduce((t, r) => t + r.hours, 0);
+  const allPeople = [...new Set(inMonth.map((b) => b.member))].length;
+
+  return (<div>
+    <Field label="Month">
+      <Select value={m} onChange={(e) => setM(e.target.value)}>{opts.map((k) => <option key={k} value={k}>{monthLabel(k)}</option>)}</Select>
+    </Field>
+    <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+      {[["Sessions", totalSessions], ["Hours", Math.round(totalHours * 10) / 10], ["People", allPeople]].map(([l, n]) => (
+        <div key={l} style={{ flex: 1, background: "#fff", border: `1px solid ${T.line}`, borderRadius: 10, padding: "12px 6px", textAlign: "center" }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: T.accent }}>{n}</div>
+          <div style={{ fontSize: 10.5, color: T.muted, marginTop: 2 }}>{l}</div>
+        </div>
+      ))}
+    </div>
+    {rows.every((r) => r.sessions === 0) && <EmptyNote>Nothing was booked in {monthLabel(m)}.</EmptyNote>}
+    {rows.filter((r) => r.sessions > 0).map((r) => (
+      <div key={r.ins.id} style={{ background: "#fff", border: `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>{r.ins.name}</div>
+            {r.ins.superUser && <div style={{ fontSize: 11.5, color: T.muted, marginTop: 2 }}>Super user: {shortName(r.ins.superUser)}</div>}
+          </div>
+          <div style={{ textAlign: "right", flexShrink: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 800, color: T.accent }}>{r.people} {r.people === 1 ? "person" : "people"}</div>
+            <div style={{ fontSize: 11.5, color: T.muted }}>{r.sessions} sessions · {Math.round(r.hours * 10) / 10} h</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 10, paddingTop: 9, borderTop: `1px solid ${T.line}` }}>
+          {r.byPerson.map((p) => (
+            <div key={p.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "3px 0" }}>
+              <span style={{ color: T.ink }}>{shortName(p.name)}</span>
+              <span style={{ color: T.muted, fontVariantNumeric: "tabular-nums" }}>{p.sessions} × · {Math.round(p.hours * 10) / 10} h</span>
             </div>
           ))}
         </div>
-      ))}
-      {instruments.length === 0 && <EmptyNote>No instruments yet.{canEdit ? " Add some above." : ""}</EmptyNote>}
+      </div>
+    ))}
+    <div style={{ fontSize: 11.5, color: T.muted, marginTop: 10, lineHeight: 1.5 }}>The same figures appear in the monthly pack, on the Instrument usage tab.</div>
+  </div>);
+}
 
-      {form && <BookingForm me={me} instruments={instruments} bookings={bookings} day={dayStr} preselect={filter !== "all" ? filter : ""} onSave={(b) => { onBook(b); setForm(false); }} onClose={() => setForm(false)} />}
+function AccessRequestSheet({ ins, onConfirm, onClose }) {
+  const [note, setNote] = useState("");
+  return (<Sheet title={`Request access — ${ins.name}`} onClose={onClose}>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>
+      {ins.superUser ? `${shortName(ins.superUser)} looks after this instrument and will be asked to sign you off.` : "A full-access member will be asked to sign you off."} Say what training you have had, or what you need it for.
     </div>
-  );
+    <Field label="Note (optional)"><Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. trained by Pilar in June, need it for EV runs" /></Field>
+    <Btn onClick={() => onConfirm(note.trim())}><Send size={16} />Send request</Btn>
+  </Sheet>);
 }
 
 function BookingForm({ me, instruments, bookings, day, preselect, onSave, onClose }) {
@@ -959,20 +1523,34 @@ function BookingForm({ me, instruments, bookings, day, preselect, onSave, onClos
   );
 }
 
-function InstrumentsPanel({ instruments, onUpsert, onDel }) {
+function InstrumentsPanel({ instruments, memberNames, onUpsert, onDel }) {
   const [nm, setNm] = useState("");
   return (
     <div style={{ background: "#fff", border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
-      <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 12 }}>Instruments</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
-        {instruments.map((i) => (<div key={i.id} style={{ ...rowFlat, gap: 8 }}>
-          <Input value={i.name} onChange={(e) => onUpsert({ ...i, name: e.target.value })} style={{ height: 38, border: "none", padding: 0, fontWeight: 600 }} />
-          <button onClick={() => onDel(i.id)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>
-        </div>))}
+      <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 4 }}>Instruments</div>
+      <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 12, lineHeight: 1.45 }}>The super user oversees training and proper use. Mark an instrument as needing sign-off and only people they approve can book it.</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
+        {instruments.map((i) => (
+          <div key={i.id} style={{ border: `1px solid ${T.line}`, borderRadius: 11, padding: 11 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <Input value={i.name} onChange={(e) => onUpsert({ ...i, name: e.target.value })} style={{ height: 38, border: "none", padding: 0, fontWeight: 700 }} />
+              <button onClick={() => onDel(i.id)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, marginBottom: 5 }}>SUPER USER</div>
+            <Select value={i.superUser || ""} onChange={(e) => onUpsert({ ...i, superUser: e.target.value })} style={{ height: 38, marginBottom: 9 }}>
+              <option value="">— nobody assigned —</option>
+              {memberNames.map((n) => <option key={n}>{n}</option>)}
+            </Select>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, cursor: "pointer" }}>
+              <input type="checkbox" checked={!!i.restricted} onChange={(e) => onUpsert({ ...i, restricted: e.target.checked })} style={{ width: 16, height: 16, marginTop: 1, flexShrink: 0 }} />
+              <span>Needs training sign-off before booking</span>
+            </label>
+          </div>
+        ))}
       </div>
       <div style={{ display: "flex", gap: 8 }}>
         <Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="Add instrument" />
-        <button onClick={() => { if (nm.trim()) { onUpsert({ id: uid(), name: nm.trim() }); setNm(""); } }} style={addBtn}><Plus size={18} /></button>
+        <button onClick={() => { if (nm.trim()) { onUpsert({ id: uid(), name: nm.trim(), superUser: "", restricted: false }); setNm(""); } }} style={addBtn}><Plus size={18} /></button>
       </div>
     </div>
   );
