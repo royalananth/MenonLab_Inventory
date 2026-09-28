@@ -84,6 +84,7 @@ export default function App() {
   const unseenRef = useRef(0);
   const lastFullRef = useRef(0);
   const lastPollRef = useRef(0);
+  const lastTouchRef = useRef(Date.now());
 
   const clearLocal = useCallback(() => {
     tokenRef.current = ""; setToken(""); setMe(""); setSrvCaps(null);
@@ -123,25 +124,45 @@ export default function App() {
     try { const t = localStorage.getItem("mlab_token"); if (t) { tokenRef.current = t; setToken(t); } } catch {}
     load();
 
-    // A hidden tab asks for nothing at all.
+    // Two rules, both there to let the database go back to sleep.
+    //
+    // A hidden tab asks for nothing at all. And a tab that is visible but that
+    // nobody has touched for a quarter of an hour drops to one check every
+    // fifteen minutes — long enough that the database's own idle timeout can
+    // suspend the compute in between. Polling faster than that timeout keeps it
+    // awake around the clock, which is what burned through the quota.
+    const IDLE_AFTER = 15 * 60 * 1000;
+    const SLOW_EVERY = 15 * 60 * 1000;
     const tick = () => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      const idle = Date.now() - lastTouchRef.current > IDLE_AFTER;
+      if (idle && Date.now() - lastPollRef.current < SLOW_EVERY) return;
+      lastPollRef.current = Date.now();
       if (Date.now() - lastFullRef.current > 30 * 60 * 1000) load();
       else load("light");
     };
     const iv = setInterval(tick, 180000);
 
+    // Anything the person actually does counts as being at the desk.
+    const touch = () => { lastTouchRef.current = Date.now(); };
+    ["pointerdown", "keydown", "wheel"].forEach((e) => window.addEventListener(e, touch, { passive: true }));
+
     // Coming back to the tab is the moment a refresh is actually wanted, but
     // don't let flicking between windows turn into a request storm.
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
+      lastTouchRef.current = Date.now();
       if (Date.now() - lastPollRef.current < 20000) return;
-      lastPollRef.current = Date.now();
       tick();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
-    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); window.removeEventListener("focus", onVisible); };
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      ["pointerdown", "keydown", "wheel"].forEach((e) => window.removeEventListener(e, touch));
+    };
   }, [load]);
 
   const signedIn = (tok) => {
