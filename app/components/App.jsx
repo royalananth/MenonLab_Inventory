@@ -64,6 +64,7 @@ export default function App() {
   const [instrAccess, setInstrAccess] = useState([]);
   const [orderEvents, setOrderEvents] = useState([]);
   const [chairLimit, setChairLimit] = useState(1000);
+  const [waCfg, setWaCfg] = useState(null);
   const [members, setMembers] = useState([]);
   const [cats, setCats] = useState([]);
   const [projects, setProjects] = useState([]);
@@ -81,25 +82,39 @@ export default function App() {
   const flash = (t) => { setToast(t); setTimeout(() => setToast(""), 2600); };
   const tokenRef = useRef("");
   const unseenRef = useRef(0);
+  const lastFullRef = useRef(0);
+  const lastPollRef = useRef(0);
 
   const clearLocal = useCallback(() => {
     tokenRef.current = ""; setToken(""); setMe(""); setSrvCaps(null);
     try { localStorage.removeItem("mlab_token"); } catch {}
   }, []);
 
-  const load = useCallback(async () => {
+  // Two shapes of refresh. A full load pulls the inventory and everything else,
+  // and happens on sign-in, on an explicit refresh, and rarely after that. The
+  // background poll asks only for what moves — orders, alerts, bookings — so an
+  // idle tab costs almost nothing. Polling at 25s with a full payload is what
+  // flattened the database.
+  const load = useCallback(async (mode) => {
     if (!tokenRef.current) { setReady(true); return; }
+    const full = mode !== "light";
     setSyncing(true);
     try {
-      const r = await fetch("/api/data", { cache: "no-store", headers: { "x-session": tokenRef.current } });
+      const r = await fetch("/api/data" + (full ? "" : "?scope=light"), { cache: "no-store", headers: { "x-session": tokenRef.current } });
       if (r.status === 401) { clearLocal(); setSyncing(false); setReady(true); return; }
       const d = await r.json();
       setMe(d.me ? d.me.name : ""); setSrvCaps(d.caps || null);
-      setMembers(d.members || []); setCats(d.categories || []); setProjects(d.projects || []);
-      setInv(d.items || []); setUsage(d.usage || []); setGrants(d.grants || []); setOrders(d.orders || []);
-      setInstruments(d.instruments || []); setBookings(d.bookings || []); setNotifs(d.notifications || []);
-      setMediaPar(d.mediaPar || []); setInstrAccess(d.instrumentAccess || []);
-      setOrderEvents(d.orderEvents || []); setChairLimit(d.chairThreshold || 1000);
+      // Always moving:
+      setGrants(d.grants || []); setOrders(d.orders || []); setBookings(d.bookings || []);
+      setNotifs(d.notifications || []); setInstrAccess(d.instrumentAccess || []);
+      setOrderEvents(d.orderEvents || []); setChairLimit(d.chairThreshold || 1000); setWaCfg(d.whatsapp || null);
+      // Only present on a full load — leave the last good copy alone otherwise.
+      if (d.scope !== "light") {
+        setMembers(d.members || []); setCats(d.categories || []); setProjects(d.projects || []);
+        setInv(d.items || []); setUsage(d.usage || []);
+        setInstruments(d.instruments || []); setMediaPar(d.mediaPar || []);
+        lastFullRef.current = Date.now();
+      }
     } catch { /* keep last good state */ }
     setSyncing(false); setReady(true);
   }, [clearLocal]);
@@ -107,10 +122,26 @@ export default function App() {
   useEffect(() => {
     try { const t = localStorage.getItem("mlab_token"); if (t) { tokenRef.current = t; setToken(t); } } catch {}
     load();
-    const iv = setInterval(load, 25000);
-    const onFocus = () => load();
-    window.addEventListener("focus", onFocus);
-    return () => { clearInterval(iv); window.removeEventListener("focus", onFocus); };
+
+    // A hidden tab asks for nothing at all.
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      if (Date.now() - lastFullRef.current > 30 * 60 * 1000) load();
+      else load("light");
+    };
+    const iv = setInterval(tick, 180000);
+
+    // Coming back to the tab is the moment a refresh is actually wanted, but
+    // don't let flicking between windows turn into a request storm.
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastPollRef.current < 20000) return;
+      lastPollRef.current = Date.now();
+      tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); window.removeEventListener("focus", onVisible); };
   }, [load]);
 
   const signedIn = (tok) => {
@@ -134,7 +165,10 @@ export default function App() {
       if (r.status === 401) { clearLocal(); flash("Signed out - please sign in again"); return out; }
       if (!r.ok) flash(out.error || "That wasn't allowed");
     } catch { /* offline: the next reload reconciles */ }
-    load();
+    // Inventory and roster edits change the heavy tables; everything else only
+    // moves an order or a booking, so a light refresh is enough.
+    const heavy = ["item", "member", "project", "category", "instrument", "mediaPar"].includes(body && body.type);
+    load(heavy ? "full" : "light");
     return out;
   };
 
@@ -194,6 +228,7 @@ export default function App() {
 
   const setMemberRole = (name, role) => { setMembers((s) => s.map((m) => m.name === name ? { ...m, role } : m)); post({ type: "member", action: "setRole", payload: { name, role } }); };
   const setOwner = (name, owner) => { post({ type: "member", action: "setOwner", payload: { name, owner } }); flash(owner ? "Can now grant access" : "Access-owner right removed"); };
+  const testWhatsApp = async (name) => { const r = await post({ type: "whatsapp", action: "test", payload: { name } }); if (r && r.ok) flash("Test message sent"); };
   const setPhone = async (name, whatsapp) => { const r = await post({ type: "member", action: "setPhone", payload: { name, whatsapp } }); if (r && r.ok) flash(whatsapp ? "WhatsApp number saved" : "Number removed"); };
 
   const memberNames = members.map((m) => m.name);
@@ -238,7 +273,7 @@ export default function App() {
               <div><div style={{ fontSize: 16.5, fontWeight: 800, letterSpacing: "-.01em", lineHeight: 1 }}>Menon Lab</div><div style={{ fontSize: 11.5, color: T.muted, marginTop: 3 }}>Inventory &amp; usage</div></div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <button onClick={load} title="Refresh" style={{ background: "none", border: "none", cursor: "pointer", color: T.muted, padding: 4 }}><RefreshCw size={16} style={syncing ? { animation: "spin 1s linear infinite" } : undefined} /></button>
+              <button onClick={() => load("full")} title="Refresh" style={{ background: "none", border: "none", cursor: "pointer", color: T.muted, padding: 4 }}><RefreshCw size={16} style={syncing ? { animation: "spin 1s linear infinite" } : undefined} /></button>
               {<button onClick={() => setShowNotif(true)} title="Alerts" style={{ position: "relative", background: "none", border: "none", cursor: "pointer", color: unseen > 0 ? T.accent : T.muted, padding: 4 }}>
                 <Bell size={18} />
                 {unseen > 0 && <span style={{ position: "absolute", top: -1, right: -3, background: T.danger, color: "#fff", fontSize: 9.5, fontWeight: 700, borderRadius: 999, minWidth: 15, height: 15, display: "grid", placeItems: "center", padding: "0 3px" }}>{unseen}</span>}
@@ -260,7 +295,7 @@ export default function App() {
         {view === "ord" && <OrdersTab {...{ me, caps, token, orders, orderEvents, chairLimit, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed: () => setOrderSeed(null), onCreate: createOrder, onUpdate: updateOrder, onAction: orderAction, onDelete: delOrder, onUpsertGrant: upsertGrant, onDelGrant: delGrant }} />}
         {view === "book" && <BookTab {...{ me, canEdit, instruments, bookings, memberNames, myAccess, accessQueue, onBook: addBooking, onCancel: delBooking, onUpsertInstrument: upsertInstrument, onDelInstrument: delInstrument, onRequestAccess: requestAccess, onDecideAccess: decideAccess }} />}
         {view === "rep" && <RepTab {...{ usage, memberNames }} />}
-        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onSetOwner: setOwner, onSetPhone: setPhone, chairLimit, onSetChairLimit: setChairThreshold, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat, onReload: load, flash }} />}
+        {view === "set" && <SetTab {...{ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember: addMember, onDelMember: delMember, onToggleAdmin: toggleAdmin, onSetRole: setMemberRole, onSetOwner: setOwner, onSetPhone: setPhone, onTestWhatsApp: testWhatsApp, waCfg, chairLimit, onSetChairLimit: setChairThreshold, onAddProject: addProject, onUpdateProject: updateProject, onDelProject: delProject, onAddCat: addCat, onDelCat: delCat, onReload: load, flash }} />}
         {view === "me" && <MeTab {...{ me, meRec, caps, token, onSignOut: signOut, flash }} />}
 
         <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: "#fff", borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: `repeat(${isGuest ? 2 : 6},1fr)`, height: 66, zIndex: 20 }}>
@@ -623,7 +658,7 @@ function RepTab({ usage, memberNames }) {
 }
 
 /* ---------- MANAGE ---------- */
-function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember, onDelMember, onToggleAdmin, onSetRole, onSetOwner, onSetPhone, chairLimit, onSetChairLimit, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat, onReload, flash }) {
+function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdit, caps, token, onAddMember, onDelMember, onToggleAdmin, onSetRole, onSetOwner, onSetPhone, onTestWhatsApp, waCfg, chairLimit, onSetChairLimit, onAddProject, onUpdateProject, onDelProject, onAddCat, onDelCat, onReload, flash }) {
   const [nm, setNm] = useState(""); const [nmEmail, setNmEmail] = useState(""); const [nmRole, setNmRole] = useState("member");
   const resetPin = async (name) => {
     if (!window.confirm(`Clear ${shortName(name)}'s PIN? They will choose a new one next time they sign in, and any device they are signed in on is signed out.`)) return;
@@ -674,9 +709,11 @@ function SetTab({ members, cats, projects, pdNames, inv, usage, mediaPar, canEdi
                 <input type="checkbox" checked={!!m.owner} onChange={(e) => onSetOwner(m.name, e.target.checked)} style={{ width: 16, height: 16 }} />
                 <span style={{ display: "flex", alignItems: "center", gap: 5 }}><Shield size={13} color={m.owner ? T.accent : T.muted} />Can grant access to others</span>
               </label>
-              <PhoneRow m={m} onSave={onSetPhone} />
+              <PhoneRow m={m} onSave={onSetPhone} onTest={onTestWhatsApp} waReady={waCfg && waCfg.ready} />
             </div>
           </div>))}</div>
+
+        <WhatsAppStatus cfg={waCfg} />
 
         <div style={{ fontSize: 11.5, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 8 }}>CHAIR APPROVAL LIMIT</div>
         <ChairLimitRow value={chairLimit} onSave={onSetChairLimit} />
@@ -866,6 +903,25 @@ function PendingBanner({ orders, me, caps, accessQueue, view, onOrders, onAccess
   );
 }
 
+const WA_LABEL = { apiKey: "ELEVENLABS_API_KEY", agentId: "ELEVENLABS_AGENT_ID", phoneNumberId: "WHATSAPP_PHONE_NUMBER_ID" };
+
+/* Whether the app can actually send a WhatsApp message yet. Until the three
+   server settings are in place, approvals only appear in the app. */
+function WhatsAppStatus({ cfg }) {
+  if (!cfg) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, borderRadius: 10, padding: "10px 12px", marginBottom: 16, lineHeight: 1.45,
+      background: cfg.ready ? "#EAF6EE" : "#FDF0DF", color: cfg.ready ? "#12603D" : "#7A4A06" }}>
+      {cfg.ready ? <Check size={15} style={{ flexShrink: 0, marginTop: 1 }} /> : <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />}
+      <div>
+        {cfg.ready
+          ? <>WhatsApp is connected. Approvals are sent to the numbers below using the <b>{cfg.template}</b> template. Use <b>Test</b> on a number to check it.</>
+          : <>WhatsApp isn&apos;t connected yet — approvals show in the app only. Still needed on the server: {(cfg.missing || []).map((k) => WA_LABEL[k] || k).join(", ")}.</>}
+      </div>
+    </div>
+  );
+}
+
 /* The line above which Dr. Menon has to sign off. Below it, a PD's approval is
    final and the order goes straight to Megan. */
 function ChairLimitRow({ value, onSave }) {
@@ -891,7 +947,7 @@ function ChairLimitRow({ value, onSave }) {
 
 /* The WhatsApp number an approval is sent to — and the number a reply is
    matched against when it comes back. */
-function PhoneRow({ m, onSave }) {
+function PhoneRow({ m, onSave, onTest, waReady }) {
   const [v, setV] = useState(m.whatsapp || "");
   const [editing, setEditing] = useState(false);
   useEffect(() => { if (!editing) setV(m.whatsapp || ""); }, [m.whatsapp, editing]);
@@ -907,6 +963,8 @@ function PhoneRow({ m, onSave }) {
           style={{ height: 36, fontSize: 12.5 }} />
         {dirty && <button onClick={() => { onSave(m.name, v.trim()); setEditing(false); }}
           style={{ flexShrink: 0, background: T.accent, color: "#fff", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Save</button>}
+        {!dirty && m.whatsapp && waReady && onTest && <button onClick={() => onTest(m.name)}
+          style={{ flexShrink: 0, background: "#fff", border: `1px solid ${T.border}`, color: T.accent, borderRadius: 9, padding: "8px 11px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Test</button>}
       </div>
       {approver && !m.whatsapp && <div style={{ fontSize: 11.5, color: T.amber, marginTop: 4, display: "flex", alignItems: "flex-start", gap: 5, lineHeight: 1.4 }}>
         <AlertTriangle size={12} style={{ flexShrink: 0, marginTop: 2 }} />No number — approvals for {shortName(m.name)} stay in the app only.

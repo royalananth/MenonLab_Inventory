@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ensureInit, q } from "../../../lib/db.js";
 import { sessionMember, tokenFrom, caps } from "../../../lib/auth.js";
+import { pingMembers, sendWhatsApp, whatsappConfig } from "../../../lib/whatsapp.js";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -64,25 +65,59 @@ async function adjustStock(itemId, newQty, restoreQty) {
 
 export async function GET(req) {
   await ensureInit();
-  const me = await sessionMember(req.headers.get("x-session") || new URL(req.url).searchParams.get("token") || "");
+  const url = new URL(req.url);
+  const me = await sessionMember(req.headers.get("x-session") || url.searchParams.get("token") || "");
   // Lab data — budgets, orders, who has what — is for signed-in members only.
   if (!me) return NextResponse.json({ signedIn: false, caps: caps(null) }, { status: 401 });
   const who = me.name;
+
+  // A full load drags the whole inventory across the wire. That is fine once,
+  // on sign-in or an explicit refresh, but it must not be what a background tab
+  // does every few seconds — that is what exhausted the database.
+  //   ?scope=light  -> just the moving parts (orders, alerts, bookings, events)
+  //   default       -> everything
+  const light = url.searchParams.get("scope") === "light";
+
+  if (light) {
+    const [orders, notifs, bookings, access, events, thr, grants] = await Promise.all([
+      q(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 400`),
+      q(`SELECT * FROM notifications WHERE recipient=$1 ORDER BY created_at DESC LIMIT 60`, [who]),
+      q(`SELECT * FROM bookings WHERE day >= $1 ORDER BY day, start_min LIMIT 800`, [new Date(Date.now() - 86400000 * 14).toISOString().slice(0, 10)]),
+      q(`SELECT * FROM instrument_access ORDER BY requested_at DESC LIMIT 200`),
+      q(`SELECT * FROM order_events ORDER BY at DESC LIMIT 600`),
+      q(`SELECT v FROM meta WHERE k='chair_threshold'`),
+      q(`SELECT id,name,budget,notes FROM grants ORDER BY name`),
+    ]);
+    return NextResponse.json({
+      scope: "light",
+      signedIn: true,
+      me: { name: me.name, role: me.role, pd: me.pd, shared: me.shared },
+      caps: caps(me),
+      grants: grants.rows.map((g) => ({ id: g.id, name: g.name, budget: Number(g.budget) || 0, notes: g.notes })),
+      orders: orders.rows.map(mapOrder),
+      bookings: bookings.rows.map((b) => ({ id: b.id, instrumentId: b.instrument_id, instrumentName: b.instrument_name, member: b.member, day: b.day, startMin: b.start_min, endMin: b.end_min, purpose: b.purpose })),
+      notifications: notifs.rows.map((n) => ({ id: n.id, kind: n.kind, title: n.title, body: n.body, orderId: n.order_id, seen: n.seen, date: n.created_at })),
+      instrumentAccess: access.rows.map((a) => ({ id: a.id, instrumentId: a.instrument_id, instrumentName: a.instrument_name, member: a.member, status: a.status, note: a.note, requestedAt: a.requested_at, decidedAt: a.decided_at, decidedBy: a.decided_by })),
+      orderEvents: events.rows.map((e) => ({ id: e.id, orderId: e.order_id, event: e.event, actor: e.actor, at: e.at, detail: e.detail, amount: Number(e.amount) || 0, grantName: e.grant_name || "", frs: e.frs || "", via: e.via || "app" })),
+      chairThreshold: Number(thr.rows[0] && thr.rows[0].v) || 1000,
+      whatsapp: (() => { const w = whatsappConfig(); return { ready: w.ready, missing: w.missing, template: w.template, lang: w.lang }; })(),
+    });
+  }
 
   const [members, categories, projects, items, usage, grants, orders, instruments, bookings, notifs, mediaPar, access, events, thr] = await Promise.all([
     q(`SELECT name,email,role,pd,owner,whatsapp,(pin_hash IS NOT NULL) AS has_pin FROM members ORDER BY name`),
     q(`SELECT name FROM categories ORDER BY ord`),
     q(`SELECT id,name,leader FROM projects ORDER BY name`),
     q(`SELECT * FROM items ORDER BY name`),
-    q(`SELECT * FROM usage_log ORDER BY ts DESC LIMIT 5000`),
+    q(`SELECT * FROM usage_log ORDER BY ts DESC LIMIT 1200`),
     q(`SELECT id,name,budget,notes FROM grants ORDER BY name`),
-    q(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 3000`),
+    q(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 800`),
     q(`SELECT id,name,ord,active,super_user,restricted FROM instruments WHERE active ORDER BY ord`),
-    q(`SELECT * FROM bookings ORDER BY day DESC, start_min ASC LIMIT 4000`),
+    q(`SELECT * FROM bookings ORDER BY day DESC, start_min ASC LIMIT 1500`),
     who ? q(`SELECT * FROM notifications WHERE recipient=$1 ORDER BY created_at DESC LIMIT 60`, [who]) : Promise.resolve({ rows: [] }),
     q(`SELECT * FROM media_par ORDER BY cell_type, name`),
-    q(`SELECT * FROM instrument_access ORDER BY requested_at DESC LIMIT 2000`),
-    q(`SELECT * FROM order_events ORDER BY at DESC LIMIT 4000`),
+    q(`SELECT * FROM instrument_access ORDER BY requested_at DESC LIMIT 500`),
+    q(`SELECT * FROM order_events ORDER BY at DESC LIMIT 1200`),
     q(`SELECT v FROM meta WHERE k='chair_threshold'`),
   ]);
 
@@ -104,6 +139,7 @@ export async function GET(req) {
     instrumentAccess: access.rows.map((a) => ({ id: a.id, instrumentId: a.instrument_id, instrumentName: a.instrument_name, member: a.member, status: a.status, note: a.note, requestedAt: a.requested_at, decidedAt: a.decided_at, decidedBy: a.decided_by })),
     orderEvents: events.rows.map((e) => ({ id: e.id, orderId: e.order_id, event: e.event, actor: e.actor, at: e.at, detail: e.detail, amount: Number(e.amount) || 0, grantName: e.grant_name || "", frs: e.frs || "", via: e.via || "app" })),
     chairThreshold: Number(thr.rows[0] && thr.rows[0].v) || 1000,
+    whatsapp: (() => { const w = whatsappConfig(); return { ready: w.ready, missing: w.missing, template: w.template, lang: w.lang }; })(),
   });
 }
 
@@ -244,6 +280,7 @@ export async function POST(req) {
         await logEvent(p.id, "requested", by, `${p.itemName} — ${money(p.total || 0)}, to ${short(p.approver)} for approval`, o, "app");
         await notify([p.approver], "approval", "Approval needed",
           `${short(by)} requested ${p.itemName} (${money(p.total || 0)}) — needs your approval and a funding account.`, p.id);
+        await pingMembers([p.approver], { orderId: p.id, stage: "pd", order: o, limit: await chairThreshold() });
       } else if (action === "update") {
         const o = (await q(`SELECT requester FROM orders WHERE id=$1`, [p.id])).rows[0];
         if (o && o.requester !== by && !c.edit) return deny("You can only edit your own requests.");
@@ -291,10 +328,12 @@ export async function POST(req) {
             `${short(by)} approved ${o.item_name} (${money(amount)}, ${g ? g.name : "no grant"}) — over the ${money(limit)} limit, needs your sign-off.`, p.id);
           await notify([o.requester], "status", "PD approved",
             `${short(by)} approved your request for ${o.item_name}. It now needs the chair's sign-off.`, p.id);
+          await pingMembers(await chairNames(), { orderId: p.id, stage: "chair", order: o, limit });
         } else {
           await notify(await purchasingNames(), "order", "Approved — ready to order",
             `${o.item_name} approved by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place.`, p.id);
           await notify([o.requester], "status", "Request approved", `${short(by)} approved your request for ${o.item_name}.`, p.id);
+          await pingMembers(await purchasingNames(), { orderId: p.id, stage: "purchasing", order: o, limit });
         }
 
       // ---------- stage two: the chair confirms, and may change the fund ----------
@@ -327,6 +366,7 @@ export async function POST(req) {
           `${o.item_name} cleared by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place on the UTMB site.`, p.id);
         await notify([o.requester, o0.pd_approver], "status", "Request fully approved",
           `${short(by)} gave final approval for ${o.item_name}.`, p.id);
+        await pingMembers(await purchasingNames(), { orderId: p.id, stage: "purchasing", order: o, limit: await chairThreshold() });
 
       } else if (action === "place") {
         if (!c.place) return deny("Only Megan places orders on the UTMB site.");
@@ -376,6 +416,25 @@ export async function POST(req) {
         const od = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
         await logEvent(p.id, "deleted", by, `Request cancelled${od ? ` — ${od.item_name}` : ""}`, od, "app");
         await q(`DELETE FROM orders WHERE id=$1`, [p.id]);
+      }
+    } else if (type === "whatsapp") {
+      if (!c.access) return deny("Only an access owner can send a test message.");
+      if (action === "test") {
+        const t = (await q(`SELECT name, whatsapp FROM members WHERE name=$1`, [payload.name])).rows[0];
+        if (!t || !t.whatsapp) return NextResponse.json({ ok: false, error: "No WhatsApp number on that record." }, { status: 400 });
+        const r = await sendWhatsApp({
+          to: t.whatsapp, name: t.name, stage: "pd", limit: await chairThreshold(),
+          order: { item_name: "Test message from the inventory app", total: 0, requester: by, project: "", grant_name: "" },
+        });
+        if (!r.ok) {
+          const why = r.reason === "not_configured"
+            ? `WhatsApp isn't configured on the server yet — missing ${(r.missing || []).join(", ")}.`
+            : r.reason === "api_error" ? `ElevenLabs refused it (${r.status}): ${r.detail}`
+              : r.reason === "no_number" ? "That number didn't parse."
+                : `Couldn't reach ElevenLabs: ${r.detail || ""}`;
+          return NextResponse.json({ ok: false, error: why }, { status: 400 });
+        }
+        return NextResponse.json({ ok: true, sentTo: t.whatsapp });
       }
     } else if (type === "setting") {
       if (!c.access) return deny("Only an access owner can change this.");
