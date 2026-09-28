@@ -119,3 +119,4 @@ The Send button stays disabled until all seven are ticked (live counter, e.g. 4/
 - **Incomplete items flagged.** Any item missing a vendor or catalog # shows an amber "needs info" tag, and a "Needs info (n)" filter chip appears in Inventory so the antibodies lacking details are easy to find and complete.
 - **Editable projects.** Projects can now be renamed and reassigned to a different program director (pencil icon in Manage), not just added and deleted.
 - **Edit or cancel an order you're placing.** While a request is still "requested," the requester (and full-access staff) can edit it, and can delete/cancel it. Full-access staff can cancel any order that hasn't been received.
+- v13
