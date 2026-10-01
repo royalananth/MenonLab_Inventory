@@ -1193,7 +1193,7 @@ function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, p
 
       {nw && <OrderForm key={orderSeed ? orderSeed.id : "blank"} me={me} projects={projects} approvers={approverNames} inv={inv} seed={orderSeed} onSave={(o) => { onCreate(o); setNw(false); clearSeed && clearSeed(); }} onClose={() => { setNw(false); clearSeed && clearSeed(); }} />}
       {editO && <OrderForm me={me} projects={projects} approvers={approverNames} inv={inv} existing={editO} onSave={(o) => { onUpdate({ ...o, id: editO.id }); setEditO(null); }} onClose={() => setEditO(null)} />}
-      {approving && <ApproveSheet o={approving} grants={grants} orders={orders} chairLimit={chairLimit} onConfirm={(x) => { onAction(approving.id, "approve", x); setApproving(null); }} onClose={() => setApproving(null)} />}
+      {approving && <ApproveSheet o={approving} grants={grants} orders={orders} chairLimit={chairLimit} caps={caps} onAddGrant={onUpsertGrant} onConfirm={(x) => { onAction(approving.id, "approve", x); setApproving(null); }} onClose={() => setApproving(null)} />}
       {chairing && <ChairSheet o={chairing} grants={grants} orders={orders} caps={caps} onConfirm={(x) => { onAction(chairing.id, "chairApprove", x); setChairing(null); }} onClose={() => setChairing(null)} />}
       {reassigning && <ReassignSheet o={reassigning} approvers={approverNames} onConfirm={(approver) => { onAction(reassigning.id, "reassign", { approver }); setReassigning(null); }} onClose={() => setReassigning(null)} />}
       {receiving && <ReceiveSheet o={receiving} onConfirm={(addItem) => { onAction(receiving.id, "receive", { addItem }); setReceiving(null); }} onClose={() => setReceiving(null)} />}
@@ -1400,8 +1400,14 @@ function NotifSheet({ notifs, onSeen, onSeenAll, onGo, onClose }) {
 
 /* The PI picks the grant and the FRS here. This is the single point where a
    funding account is attached to a purchase. */
-function ApproveSheet({ o, grants, orders, chairLimit, onConfirm, onClose }) {
+function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfirm, onClose }) {
   const [grantId, setGrantId] = useState(o.grantId || (grants[0] ? grants[0].id : ""));
+  const [adding, setAdding] = useState(false); const [newNm, setNewNm] = useState(""); const [newBud, setNewBud] = useState("");
+  const addGrant = () => {
+    if (!newNm.trim()) return;
+    const g = { id: uid(), name: newNm.trim(), budget: parseFloat(newBud) || 0, notes: "" };
+    onAddGrant && onAddGrant(g); setGrantId(g.id); setNewNm(""); setNewBud(""); setAdding(false);
+  };
   const [frs, setFrs] = useState(o.frs || "");
   const grant = grants.find((g) => g.id === grantId);
   const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
@@ -1416,7 +1422,8 @@ function ApproveSheet({ o, grants, orders, chairLimit, onConfirm, onClose }) {
       fundNote: grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "",
     });
   };
-  const toChair = (Number(o.total) || 0) >= chairLimit;
+  const isChair = !!(caps && caps.chair);
+  const toChair = !isChair && (Number(o.total) || 0) >= chairLimit;
   return (<Sheet title="Approve and assign funding" onClose={onClose}>
     <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
     <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
@@ -1436,7 +1443,19 @@ function ApproveSheet({ o, grants, orders, chairLimit, onConfirm, onClose }) {
         {over ? " This purchase exceeds what's left." : ` After this, ${money(remaining - o.total)}.`}
       </div>
     )}
-    {grants.length === 0 && <div style={{ fontSize: 12.5, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14 }}>No grants set up yet. Add them under Orders → Manage grants &amp; budgets.</div>}
+    {grants.length === 0 && !adding && <div style={{ fontSize: 12.5, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 10 }}>No grants set up yet — add one below and it will appear in the list.</div>}
+    {caps && caps.grants && onAddGrant && (adding ? (
+      <div style={{ background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: 12, marginTop: -6, marginBottom: 14 }}>
+        <Field label="Grant / fund name"><Input value={newNm} onChange={(e) => setNewNm(e.target.value)} placeholder="e.g. R01HD114744" /></Field>
+        <Field label="Budget ($, optional)"><Input value={newBud} onChange={(e) => setNewBud(e.target.value)} inputMode="decimal" placeholder="0.00" /></Field>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn onClick={addGrant} style={{ opacity: newNm.trim() ? 1 : .5 }}>Add and select</Btn>
+          <Btn kind="ghost" onClick={() => setAdding(false)}>Cancel</Btn>
+        </div>
+      </div>
+    ) : (
+      <button onClick={() => setAdding(true)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginTop: -6, marginBottom: 14, padding: 0, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />Add a new grant</button>
+    ))}
 
     <Field label="FRS / account number *">
       <Input value={frs} onChange={(e) => setFrs(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
@@ -1444,7 +1463,9 @@ function ApproveSheet({ o, grants, orders, chairLimit, onConfirm, onClose }) {
     <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>Recorded on the order along with the fund position at the moment you approve, so the charge can be traced later.</div>
     <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, background: toChair ? "#FDF0DF" : "#E6F3F4", color: toChair ? "#7A4A06" : T.accentInk, borderRadius: 10, padding: "10px 12px", marginBottom: 14, lineHeight: 1.45 }}>
       {toChair ? <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} /> : <Check size={15} style={{ flexShrink: 0, marginTop: 1 }} />}
-      <div>{toChair
+      <div>{isChair
+        ? <>Your approval is final — this goes straight to <b>Megan</b> to place on the UTMB site.</>
+        : toChair
         ? <>At {money(o.total)} this is over the {money(chairLimit)} limit, so it goes to <b>Dr. Menon</b> next. He can change the fund before it reaches Megan.</>
         : <>Under the {money(chairLimit)} limit — this goes straight to <b>Megan</b> to place on the UTMB site.</>}</div>
     </div>

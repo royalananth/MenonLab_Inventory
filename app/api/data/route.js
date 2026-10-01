@@ -312,7 +312,10 @@ export async function POST(req) {
         // Above the line, Dr. Menon has to see it. Below, it goes straight to Megan.
         const limit = await chairThreshold();
         const amount = Number(o0.total) || 0;
-        const needsChair = amount >= limit;
+        // When Dr. Menon approves an order himself, his approval is already the
+        // final one — never route it back to him for a second sign-off.
+        const isChair = me.role === "chair";
+        const needsChair = !isChair && amount >= limit;
         const frs = String(p.frs).trim();
         await q(`UPDATE orders SET status=$2, pd_approver=$3, pd_approved_at=now(), pd_frs=$4, pd_grant_id=$5, pd_grant_name=$6,
                         frs=$4, grant_id=$5, grant_name=$6, fund_note=$7, needs_chair=$8, approved_via='app',
@@ -321,8 +324,9 @@ export async function POST(req) {
                   WHERE id=$1 AND status='requested'`,
           [p.id, needsChair ? "pd_ok" : "approved", by, frs, g ? g.id : "", g ? g.name : (p.grantName || ""), fundNote, needsChair]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
-        await logEvent(p.id, "pd_approved", by,
-          `PD approval · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs}` + (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), o, "app");
+        await logEvent(p.id, isChair ? "chair_approved" : "pd_approved", by, isChair
+          ? `Final approval by the chair · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs} — straight to purchasing`
+          : `PD approval · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs}` + (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), o, "app");
         if (needsChair) {
           await notify(await chairNames(), "approval", "Chair approval needed",
             `${short(by)} approved ${o.item_name} (${money(amount)}, ${g ? g.name : "no grant"}) — over the ${money(limit)} limit, needs your sign-off.`, p.id);

@@ -123,7 +123,8 @@ export async function POST(req) {
   if (atPd) {
     // Over the limit it goes on to Dr. Menon rather than to purchasing.
     const limit = await chairThreshold();
-    const needsChair = amount >= limit;
+    // Dr. Menon approving at stage one is already the final sign-off.
+    const needsChair = me.role !== "chair" && amount >= limit;
     await q(
       `UPDATE orders SET status = $2, pd_approver = $3, pd_approved_at = now(),
               pd_frs = $4, pd_grant_id = $5, pd_grant_name = $6,
