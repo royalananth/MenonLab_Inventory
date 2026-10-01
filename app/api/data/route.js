@@ -86,14 +86,14 @@ export async function GET(req) {
       q(`SELECT * FROM instrument_access ORDER BY requested_at DESC LIMIT 200`),
       q(`SELECT * FROM order_events ORDER BY at DESC LIMIT 600`),
       q(`SELECT v FROM meta WHERE k='chair_threshold'`),
-      q(`SELECT id,name,budget,notes FROM grants ORDER BY name`),
+      q(`SELECT id,name,budget,notes,frs FROM grants ORDER BY name`),
     ]);
     return NextResponse.json({
       scope: "light",
       signedIn: true,
       me: { name: me.name, role: me.role, pd: me.pd, shared: me.shared },
       caps: caps(me),
-      grants: grants.rows.map((g) => ({ id: g.id, name: g.name, budget: Number(g.budget) || 0, notes: g.notes })),
+      grants: grants.rows.map((g) => ({ id: g.id, name: g.name, budget: Number(g.budget) || 0, notes: g.notes, frs: g.frs || "" })),
       orders: orders.rows.map(mapOrder),
       bookings: bookings.rows.map((b) => ({ id: b.id, instrumentId: b.instrument_id, instrumentName: b.instrument_name, member: b.member, day: b.day, startMin: b.start_min, endMin: b.end_min, purpose: b.purpose })),
       notifications: notifs.rows.map((n) => ({ id: n.id, kind: n.kind, title: n.title, body: n.body, orderId: n.order_id, seen: n.seen, date: n.created_at })),
@@ -110,7 +110,7 @@ export async function GET(req) {
     q(`SELECT id,name,leader FROM projects ORDER BY name`),
     q(`SELECT * FROM items ORDER BY name`),
     q(`SELECT * FROM usage_log ORDER BY ts DESC LIMIT 1200`),
-    q(`SELECT id,name,budget,notes FROM grants ORDER BY name`),
+    q(`SELECT id,name,budget,notes,frs FROM grants ORDER BY name`),
     q(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 800`),
     q(`SELECT id,name,ord,active,super_user,restricted FROM instruments WHERE active ORDER BY ord`),
     q(`SELECT * FROM bookings ORDER BY day DESC, start_min ASC LIMIT 1500`),
@@ -130,7 +130,7 @@ export async function GET(req) {
     projects: projects.rows,
     items: items.rows.map(mapItem),
     usage: usage.rows.map(mapUsage),
-    grants: grants.rows.map((g) => ({ id: g.id, name: g.name, budget: Number(g.budget) || 0, notes: g.notes })),
+    grants: grants.rows.map((g) => ({ id: g.id, name: g.name, budget: Number(g.budget) || 0, notes: g.notes, frs: g.frs || "" })),
     orders: orders.rows.map(mapOrder),
     instruments: instruments.rows.map((r) => ({ id: r.id, name: r.name, superUser: r.super_user || "", restricted: !!r.restricted })),
     bookings: bookings.rows.map((b) => ({ id: b.id, instrumentId: b.instrument_id, instrumentName: b.instrument_name, member: b.member, day: b.day, startMin: b.start_min, endMin: b.end_min, purpose: b.purpose })),
@@ -265,8 +265,8 @@ export async function POST(req) {
       if (action === "add") await q(`INSERT INTO categories (name,ord) VALUES ($1,(SELECT COALESCE(MAX(ord),0)+1 FROM categories)) ON CONFLICT (name) DO NOTHING`, [payload.name]);
       else if (action === "delete") await q(`DELETE FROM categories WHERE name=$1`, [payload.name]);
     } else if (type === "grant") {
-      if (!c.grants) return deny("Only the chair and program directors can set grants and budgets.");
-      if (action === "upsert") await q(`INSERT INTO grants (id,name,budget,notes) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET name=$2,budget=$3,notes=$4`, [payload.id, payload.name, payload.budget || 0, payload.notes || ""]);
+      if (!c.grants && !c.place) return deny("Only the chair, program directors and purchasing can set grants.");
+      if (action === "upsert") await q(`INSERT INTO grants (id,name,budget,notes,frs) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET name=$2,budget=$3,notes=$4,frs=$5`, [payload.id, payload.name, payload.budget || 0, payload.notes || "", payload.frs || ""]);
       else if (action === "delete") await q(`DELETE FROM grants WHERE id=$1`, [payload.id]);
     } else if (type === "order") {
       const p = payload;
@@ -302,8 +302,9 @@ export async function POST(req) {
         if (!o0) return NextResponse.json({ ok: false, error: "No such order." }, { status: 404 });
         if (o0.status !== "requested") return NextResponse.json({ ok: false, error: `That order is already ${o0.status}.` }, { status: 409 });
         if (o0.approver && o0.approver !== by && me.role !== "chair") return deny(`This one was sent to ${short(o0.approver)}.`);
-        if (!p.frs || !String(p.frs).trim()) return NextResponse.json({ ok: false, error: "An FRS account is required to approve." }, { status: 400 });
-        const g = p.grantId ? (await q(`SELECT id,name,budget FROM grants WHERE id=$1`, [p.grantId])).rows[0] : null;
+        // Approvers pick the grant by name. Megan attaches the FRS when she places it.
+        const g = p.grantId ? (await q(`SELECT id,name,budget,frs FROM grants WHERE id=$1`, [p.grantId])).rows[0] : null;
+        if (!g) return NextResponse.json({ ok: false, error: "Pick the grant this should be charged to." }, { status: 400 });
         let fundNote = "";
         if (g) {
           const spent = (await q(`SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE grant_id=$1 AND status IN ('approved','ordered','received')`, [g.id])).rows[0];
@@ -316,7 +317,7 @@ export async function POST(req) {
         // final one — never route it back to him for a second sign-off.
         const isChair = me.role === "chair";
         const needsChair = !isChair && amount >= limit;
-        const frs = String(p.frs).trim();
+        const frs = String(p.frs || "").trim();
         await q(`UPDATE orders SET status=$2, pd_approver=$3, pd_approved_at=now(), pd_frs=$4, pd_grant_id=$5, pd_grant_name=$6,
                         frs=$4, grant_id=$5, grant_name=$6, fund_note=$7, needs_chair=$8, approved_via='app',
                         pi_approver = CASE WHEN $8 THEN NULL ELSE $3 END,
@@ -325,8 +326,8 @@ export async function POST(req) {
           [p.id, needsChair ? "pd_ok" : "approved", by, frs, g ? g.id : "", g ? g.name : (p.grantName || ""), fundNote, needsChair]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
         await logEvent(p.id, isChair ? "chair_approved" : "pd_approved", by, isChair
-          ? `Final approval by the chair · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs} — straight to purchasing`
-          : `PD approval · ${money(amount)} · ${g ? g.name : "no grant"} · FRS ${frs}` + (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), o, "app");
+          ? `Final approval by the chair · ${money(amount)} · ${g.name} — straight to purchasing for the FRS`
+          : `PD approval · ${money(amount)} · ${g.name}` + (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), o, "app");
         if (needsChair) {
           await notify(await chairNames(), "approval", "Chair approval needed",
             `${short(by)} approved ${o.item_name} (${money(amount)}, ${g ? g.name : "no grant"}) — over the ${money(limit)} limit, needs your sign-off.`, p.id);
@@ -335,7 +336,7 @@ export async function POST(req) {
           await pingMembers(await chairNames(), { orderId: p.id, stage: "chair", order: o, limit });
         } else {
           await notify(await purchasingNames(), "order", "Approved — ready to order",
-            `${o.item_name} approved by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place.`, p.id);
+            `${o.item_name} approved by ${short(by)} · ${g.name}. Add the FRS and place it.`, p.id);
           await notify([o.requester], "status", "Request approved", `${short(by)} approved your request for ${o.item_name}.`, p.id);
           await pingMembers(await purchasingNames(), { orderId: p.id, stage: "purchasing", order: o, limit });
         }
@@ -350,24 +351,24 @@ export async function POST(req) {
         // Keep the PD's proposal unless the chair changes it.
         const gid = p.grantId !== undefined && p.grantId !== null ? p.grantId : o0.pd_grant_id;
         const g = gid ? (await q(`SELECT id,name,budget FROM grants WHERE id=$1`, [gid])).rows[0] : null;
+        if (!g) return NextResponse.json({ ok: false, error: "Pick the grant this should be charged to." }, { status: 400 });
         const frs = (p.frs !== undefined && String(p.frs).trim()) ? String(p.frs).trim() : (o0.pd_frs || "");
-        if (!frs) return NextResponse.json({ ok: false, error: "An FRS account is required." }, { status: 400 });
         let fundNote = o0.fund_note || "";
         if (g) {
           const spent = (await q(`SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE grant_id=$1 AND status IN ('approved','ordered','received')`, [g.id])).rows[0];
           fundNote = `${g.name}: ${money((Number(g.budget) || 0) - (Number(spent.s) || 0))} available at chair approval`;
         }
-        const changed = (g ? g.id : "") !== (o0.pd_grant_id || "") || frs !== (o0.pd_frs || "");
+        const changed = (g ? g.id : "") !== (o0.pd_grant_id || "");
         await q(`UPDATE orders SET status='approved', pi_approver=$2, pi_approved_at=now(),
                         frs=$3, grant_id=$4, grant_name=$5, fund_note=$6, approved_via='app' WHERE id=$1 AND status='pd_ok'`,
           [p.id, by, frs, g ? g.id : "", g ? g.name : "", fundNote]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
         await logEvent(p.id, "chair_approved", by,
-          `Final approval · ${money(Number(o0.total) || 0)} · ${g ? g.name : "no grant"} · FRS ${frs}` +
-          (changed ? ` (changed from ${o0.pd_grant_name || "no grant"} / FRS ${o0.pd_frs || "none"})` : "") +
+          `Final approval · ${money(Number(o0.total) || 0)} · ${g.name}` +
+          (changed ? ` (changed from ${o0.pd_grant_name || "no grant"})` : "") +
           (onBehalf ? " — given by the access owner on the chair's behalf" : ""), o, "app");
         await notify(await purchasingNames(), "order", "Approved — ready to order",
-          `${o.item_name} cleared by ${short(by)} · FRS ${frs}${g ? " · " + g.name : ""}. Ready to place on the UTMB site.`, p.id);
+          `${o.item_name} cleared by ${short(by)} · ${g.name}. Add the FRS and place it on the UTMB site.`, p.id);
         await notify([o.requester, o0.pd_approver], "status", "Request fully approved",
           `${short(by)} gave final approval for ${o.item_name}.`, p.id);
         await pingMembers(await purchasingNames(), { orderId: p.id, stage: "purchasing", order: o, limit: await chairThreshold() });
@@ -377,10 +378,15 @@ export async function POST(req) {
         const o0 = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
         if (!o0 || o0.status !== "approved") return NextResponse.json({ ok: false, error: o0 ? `That order is ${o0.status}, not ready to place.` : "No such order." }, { status: 409 });
         const onBehalf = me.role !== "purchasing";
-        await q(`UPDATE orders SET status='ordered', purchaser=$2, po=$3, ordered_at=now(), placed_via=$4 WHERE id=$1 AND status='approved'`,
-          [p.id, by, p.po || "", onBehalf ? "owner" : "purchasing"]);
+        // Megan attaches the FRS here, from the grant the approver named.
+        const frsP = String(p.frs || o0.frs || "").trim();
+        if (!frsP) return NextResponse.json({ ok: false, error: "Add the FRS number for this grant before placing." }, { status: 400 });
+        await q(`UPDATE orders SET status='ordered', purchaser=$2, po=$3, ordered_at=now(), placed_via=$4, frs=$5 WHERE id=$1 AND status='approved'`,
+          [p.id, by, p.po || "", onBehalf ? "owner" : "purchasing", frsP]);
+        // Remember it on the grant so the next order on that grant fills in by itself.
+        if (o0.grant_id && p.rememberFrs !== false) await q(`UPDATE grants SET frs=$2 WHERE id=$1 AND COALESCE(frs,'')=''`, [o0.grant_id, frsP]);
         const o = (await q(`SELECT * FROM orders WHERE id=$1`, [p.id])).rows[0];
-        await logEvent(p.id, "placed", by, `Placed on the UTMB site${p.po ? ` · PO ${p.po}` : ""}${onBehalf ? " — by the access owner, not purchasing" : ""}`, o, "app");
+        await logEvent(p.id, "placed", by, `Placed on the UTMB site · ${o0.grant_name || "no grant"} · FRS ${frsP}${p.po ? ` · PO ${p.po}` : ""}${onBehalf ? " — by the access owner, not purchasing" : ""}`, o, "app");
         await notify([o.requester, o.pd_approver, o.pi_approver], "status", "Order placed",
           `${short(by)} placed the order for ${o.item_name}${p.po ? " (PO " + p.po + ")" : ""}.`, p.id);
       } else if (action === "receive") {

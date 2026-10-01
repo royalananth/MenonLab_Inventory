@@ -6,7 +6,7 @@
 //   phone:      "+12815550134"      the sender's WhatsApp number
 //   orderId:    "o12ab"
 //   decision:   "approve" | "reject"
-//   frs:        "123456"            required on approve
+//   frs:        "123456"            optional; Megan adds it when placing
 //   reason:     "buy the 50ug size" optional, on reject
 //   transcript: "approve it, MPRINT"   what the person actually said or typed
 // }
@@ -93,15 +93,8 @@ export async function POST(req) {
     });
   }
 
-  const frsIn = frs || (atChair ? o.pd_frs : "");
-  if (!frsIn || !String(frsIn).trim()) {
-    return NextResponse.json({
-      ok: false,
-      needsFrs: true,
-      spoken: "Which FRS should this be charged to?",
-    }, { status: 422 });
-  }
-  frs = frsIn;
+  // The FRS is optional here — Megan attaches it from the grant when she places the order.
+  frs = frs || (atChair ? o.pd_frs : "") || "";
 
   // The PI names the grant as well as the FRS; the requester never did.
   const grantRef = body.grant || body.grantId || o.grant_id || o.pd_grant_id;
@@ -138,7 +131,7 @@ export async function POST(req) {
     );
     const after0 = (await q(`SELECT * FROM orders WHERE id = $1`, [orderId])).rows[0];
     await logEvent(orderId, "pd_approved", me.name,
-      `PD approval over WhatsApp · ${money(amount)} · ${pos ? pos.grant : "no grant"} · FRS ${frsClean}` +
+      `PD approval over WhatsApp · ${money(amount)} · ${pos ? pos.grant : "no grant"}` + (frsClean ? ` · FRS ${frsClean}` : "") +
       (needsChair ? ` — over the ${money(limit)} limit, sent to the chair` : " — under the limit, straight to purchasing"), after0, "whatsapp");
     if (needsChair) {
       const chairs = (await q(`SELECT name FROM members WHERE role = 'chair'`)).rows.map((r) => r.name);
@@ -165,12 +158,12 @@ export async function POST(req) {
     );
     const after0 = (await q(`SELECT * FROM orders WHERE id = $1`, [orderId])).rows[0];
     await logEvent(orderId, "chair_approved", me.name,
-      `Final approval over WhatsApp · ${money(amount)} · ${pos ? pos.grant : o.grant_name || "no grant"} · FRS ${frsClean}`, after0, "whatsapp");
+      `Final approval over WhatsApp · ${money(amount)} · ${pos ? pos.grant : o.grant_name || "no grant"}` + (frsClean ? ` · FRS ${frsClean}` : ""), after0, "whatsapp");
   }
 
   const purchasing = (await q(`SELECT name FROM members WHERE role IN ('purchasing', 'admin')`)).rows.map((r) => r.name);
   await notify(purchasing, "order", "Approved — ready to order",
-    o.item_name + " was approved by " + shortName(me.name) + " (FRS " + String(frs).trim() + ", via WhatsApp). Ready to place.", orderId);
+    o.item_name + " was approved by " + shortName(me.name) + " (via WhatsApp). Add the FRS and place it.", orderId);
   await notify([o.requester], "status", "Request approved",
     shortName(me.name) + " approved your request for " + o.item_name + ".", orderId);
 

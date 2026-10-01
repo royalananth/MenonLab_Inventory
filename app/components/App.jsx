@@ -224,7 +224,7 @@ export default function App() {
     // The server decides whether a PD approval ends the chain or hands it to the
     // chair, so don't guess the next status for that one — just reload.
     if (action !== "approve") {
-      setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "chairApprove" ? { piApprover: me } : action === "reassign" ? { approver: extra.approver } : action === "place" ? { purchaser: me, po: extra.po } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
+      setOrders((s) => s.map((o) => o.id === id ? { ...o, status: STMAP[action] || o.status, ...(action === "chairApprove" ? { piApprover: me } : action === "reassign" ? { approver: extra.approver } : action === "place" ? { purchaser: me, po: extra.po, frs: extra.frs || o.frs } : action === "reject" ? { rejectReason: extra.reason } : {}) } : o));
     }
     const r = await post({ type: "order", action, payload: { id, ...extra } });
     if (!r || !r.ok) return;
@@ -1161,8 +1161,8 @@ function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, p
             </div>); })}
         </div>
       )}
-      {caps.grants && <button onClick={() => setShowGrants((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />{showGrants ? "Hide grant setup" : "Manage grants & budgets"}</button>}
-      {showGrants && caps.grants && <GrantsPanel grants={grants} onUpsert={onUpsertGrant} onDel={onDelGrant} />}
+      {(caps.grants || caps.place) && <button onClick={() => setShowGrants((s) => !s)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />{showGrants ? "Hide grant setup" : "Manage grants & budgets"}</button>}
+      {showGrants && (caps.grants || caps.place) && <GrantsPanel grants={grants} onUpsert={onUpsertGrant} onDel={onDelGrant} />}
       {caps.grants && <SpendPanel orders={orders} grants={grants} />}
       {caps.reports && (
         <div style={{ marginBottom: 14 }}>
@@ -1170,7 +1170,7 @@ function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, p
             <Btn onClick={weeklyPack}><FileSpreadsheet size={16} />Weekly pack</Btn>
             <Btn onClick={monthlyPack}><FileSpreadsheet size={16} />Monthly pack</Btn>
           </div>
-          <div style={{ fontSize: 11.5, color: T.muted, lineHeight: 1.5 }}>Every order with its full chain — who requested, which PD approved, whether Dr. Menon signed off, the grant and FRS at each step, who placed it, and the PO. Plus what is stuck and with whom, spend by person, spend by approver, and the complete audit trail. The monthly pack adds inventory, restocking and instrument usage.</div>
+          <div style={{ fontSize: 11.5, color: T.muted, lineHeight: 1.5 }}>Every order with its full chain — who requested, which PD approved, whether Dr. Menon signed off, the grant at each step, the FRS Megan charged, who placed it, and the PO. Plus what is stuck and with whom, spend by person, spend by approver, and the complete audit trail. The monthly pack adds inventory, restocking and instrument usage.</div>
         </div>
       )}
 
@@ -1213,7 +1213,8 @@ function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAct
   const mineChair = atChair && caps.chairBackup;
   const willNeedChair = (Number(o.total) || 0) >= chairLimit;
   const reject = () => { const r = window.prompt("Reason for sending back?") || ""; onAction(o.id, "reject", { reason: r }); };
-  const place = () => { const po = window.prompt("PO / order reference from the UTMB site (optional):") || ""; onAction(o.id, "place", { po }); };
+  const [placing, setPlacing] = useState(false);
+  const place = () => setPlacing(true);
   const mine = minePd || mineChair;
   const stripe = mineChair ? "#B45309" : minePd ? "#6D3BB5" : null;
 
@@ -1226,7 +1227,8 @@ function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAct
     { key: "got", label: "Received", who: "", done: o.status === "received", active: o.status === "ordered" },
   ];
 
-  return (
+  return (<>
+    {placing && <PlaceSheet o={o} grant={grant} onClose={() => setPlacing(false)} onConfirm={(x) => { onAction(o.id, "place", x); setPlacing(false); }} />}
     <div style={{ background: "#fff", border: `1px solid ${stripe ? stripe + "55" : T.line}`, borderLeft: stripe ? `3px solid ${stripe}` : `1px solid ${T.line}`, borderRadius: 12, padding: 13, marginBottom: 10 }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
         <div style={{ minWidth: 0 }}><div style={{ fontSize: 14.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.itemName}</div>
@@ -1252,7 +1254,8 @@ function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAct
       </div>}
 
       {o.experiment && <div style={{ fontSize: 12, color: T.muted, marginTop: 6 }}><b style={{ color: T.ink, fontWeight: 600 }}>Reason:</b> {o.experiment}</div>}
-      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.pdApprover ? ` · proposed by ${shortName(o.pdApprover)}` : ""}{o.piApprover && o.needsChair ? ` · confirmed by ${shortName(o.piApprover)}` : ""}{o.approvedVia === "whatsapp" ? " · via WhatsApp" : ""}</div>}
+      {o.frs && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>FRS:</b> <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.frs}</span>{o.purchaser ? ` · added by ${shortName(o.purchaser)}` : ""}</div>}
+      {!o.frs && o.status === "approved" && <div style={{ fontSize: 12, color: T.amber, marginTop: 4 }}>FRS: Megan adds this from the grant when placing</div>}
       {o.pdFrs && o.frs && o.pdFrs !== o.frs && <div style={{ fontSize: 11.5, color: T.amber, marginTop: 3 }}>Chair changed the account from FRS {o.pdFrs}{o.pdGrantName ? ` (${o.pdGrantName})` : ""}</div>}
       {o.po && <div style={{ fontSize: 12, color: T.muted, marginTop: 4 }}><b style={{ color: T.ink, fontWeight: 600 }}>PO:</b> {o.po}{o.purchaser ? ` · ${shortName(o.purchaser)}` : ""}</div>}
       {o.explored && <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}><b style={{ color: T.ink, fontWeight: 600 }}>Explored:</b> {o.explored}</div>}
@@ -1296,7 +1299,35 @@ function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAct
         </div>
       )}
     </div>
-  );
+  </>);
+}
+
+/* Megan attaches the FRS here, looked up from the grant name the approver
+   picked. It fills in by itself once a grant has an FRS on file. */
+function PlaceSheet({ o, grant, onConfirm, onClose }) {
+  const [frs, setFrs] = useState(o.frs || (grant && grant.frs) || "");
+  const [po, setPo] = useState("");
+  const ok = frs.trim().length > 0;
+  return (<Sheet title="Place order" onClose={onClose}>
+    <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
+    <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
+    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 12 }}>{money(o.total)}</div>
+    <div style={{ background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 11, padding: "11px 13px", marginBottom: 16 }}>
+      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 4 }}>GRANT</div>
+      <div style={{ fontSize: 14, fontWeight: 700 }}>{o.grantName || "No grant named"}</div>
+      <div style={{ fontSize: 11.5, color: T.muted, marginTop: 3 }}>Approved by {shortName(o.piApprover || o.pdApprover || "")}</div>
+    </div>
+    <Field label="FRS / account number for this grant *">
+      <Input value={frs} onChange={(e) => setFrs(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
+    </Field>
+    {grant && grant.frs && frs.trim() === grant.frs && <div style={{ fontSize: 11.5, color: T.muted, marginTop: -6, marginBottom: 12 }}>Filled in from the FRS on file for {grant.name}.</div>}
+    {grant && !grant.frs && <div style={{ fontSize: 11.5, color: T.muted, marginTop: -6, marginBottom: 12 }}>Saved to {grant.name}, so it fills in next time.</div>}
+    <Field label="PO / order reference (optional)">
+      <Input value={po} onChange={(e) => setPo(e.target.value)} placeholder="from the UTMB site" />
+    </Field>
+    <Btn onClick={() => ok && onConfirm({ frs: frs.trim(), po: po.trim() })} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Mark placed</Btn>
+    {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>Add the FRS to place the order.</div>}
+  </Sheet>);
 }
 const ActBtn = ({ kind = "primary", icon: Icon, children, ...p }) => (<button {...p} style={{ display: "inline-flex", alignItems: "center", gap: 5, border: kind === "ghost" ? `1px solid ${T.border}` : "1px solid transparent", background: kind === "ghost" ? "#fff" : T.accent, color: kind === "ghost" ? T.ink : "#fff", borderRadius: 9, padding: "8px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}><Icon size={15} />{children}</button>);
 
@@ -1342,7 +1373,7 @@ function OrderForm({ me, projects, approvers, inv, existing, seed, onSave, onClo
         </Select>
       </Field>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 12px", marginTop: -6, marginBottom: 14, lineHeight: 1.45 }}>
-        <DollarSign size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The PD chooses the grant and FRS when they approve, and Dr. Menon confirms it on larger orders. You don&apos;t pick the funding account.</div>
+        <DollarSign size={15} style={{ flexShrink: 0, marginTop: 1 }} /><div>The PD picks the grant when they approve, Dr. Menon confirms it on larger orders, and Megan adds the FRS when she places it. You don&apos;t pick the funding account.</div>
       </div>
 
       <Field label="Reason — experiment / justification *"><Input value={f.experiment} onChange={(e) => set("experiment", e.target.value)} placeholder="What is it for? e.g. P-gp WB, Aim 2" /></Field>
@@ -1408,15 +1439,14 @@ function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfi
     const g = { id: uid(), name: newNm.trim(), budget: parseFloat(newBud) || 0, notes: "" };
     onAddGrant && onAddGrant(g); setGrantId(g.id); setNewNm(""); setNewBud(""); setAdding(false);
   };
-  const [frs, setFrs] = useState(o.frs || "");
   const grant = grants.find((g) => g.id === grantId);
   const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
   const over = grant && grant.budget > 0 && remaining < o.total;
-  const ok = frs.trim().length > 0;
+  const ok = !!grant;
   const go = () => {
     if (!ok) return;
     onConfirm({
-      frs: frs.trim(),
+      frs: "",
       grantId: grant ? grant.id : "",
       grantName: grant ? grant.name : "",
       fundNote: grant && grant.budget > 0 ? `${grant.name}: ${money(remaining)} available at approval` : "",
@@ -1433,7 +1463,7 @@ function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfi
 
     <Field label="Charge to which grant?">
       <Select value={grantId} onChange={(e) => setGrantId(e.target.value)}>
-        <option value="">— no grant —</option>
+        <option value="">— pick a grant —</option>
         {grants.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
       </Select>
     </Field>
@@ -1457,10 +1487,7 @@ function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfi
       <button onClick={() => setAdding(true)} style={{ background: "none", border: "none", color: T.accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", marginTop: -6, marginBottom: 14, padding: 0, display: "flex", alignItems: "center", gap: 5 }}><DollarSign size={14} />Add a new grant</button>
     ))}
 
-    <Field label="FRS / account number *">
-      <Input value={frs} onChange={(e) => setFrs(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
-    </Field>
-    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>Recorded on the order along with the fund position at the moment you approve, so the charge can be traced later.</div>
+    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>No FRS needed — Megan adds the FRS for this grant when she places the order.</div>
     <div style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12.5, background: toChair ? "#FDF0DF" : "#E6F3F4", color: toChair ? "#7A4A06" : T.accentInk, borderRadius: 10, padding: "10px 12px", marginBottom: 14, lineHeight: 1.45 }}>
       {toChair ? <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} /> : <Check size={15} style={{ flexShrink: 0, marginTop: 1 }} />}
       <div>{isChair
@@ -1470,7 +1497,7 @@ function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfi
         : <>Under the {money(chairLimit)} limit — this goes straight to <b>Megan</b> to place on the UTMB site.</>}</div>
     </div>
     <Btn onClick={go} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />{toChair ? "Approve and send to Dr. Menon" : "Approve and send to Megan"}</Btn>
-    {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>An FRS account is required.</div>}
+    {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>Pick a grant to approve.</div>}
   </Sheet>);
 }
 
@@ -1478,13 +1505,12 @@ function ApproveSheet({ o, grants, orders, chairLimit, caps, onAddGrant, onConfi
    move the charge somewhere else before Megan places anything. */
 function ChairSheet({ o, grants, orders, caps, onConfirm, onClose }) {
   const [grantId, setGrantId] = useState(o.grantId || "");
-  const [frs, setFrs] = useState(o.frs || o.pdFrs || "");
   const grant = grants.find((g) => g.id === grantId);
   const remaining = grant ? grant.budget - committedFor(orders, grant.id) : null;
   const over = grant && grant.budget > 0 && remaining < o.total;
-  const changed = (grantId || "") !== (o.pdGrantName ? (grants.find((g) => g.name === o.pdGrantName) || {}).id || "" : "") || frs.trim() !== (o.pdFrs || "");
+  const changed = (grantId || "") !== (o.pdGrantName ? (grants.find((g) => g.name === o.pdGrantName) || {}).id || "" : "");
   const onBehalf = !caps.chair;
-  const ok = frs.trim().length > 0;
+  const ok = !!grant;
   return (<Sheet title="Final approval" onClose={onClose}>
     <div style={{ fontSize: 15, marginBottom: 3, fontWeight: 700 }}>{o.itemName}</div>
     <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 6 }}>{[o.qty && `×${o.qty}`, o.vendor, o.catalog].filter(Boolean).join(" · ")}</div>
@@ -1493,7 +1519,7 @@ function ChairSheet({ o, grants, orders, caps, onConfirm, onClose }) {
 
     <div style={{ background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 11, padding: "11px 13px", marginBottom: 16 }}>
       <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: ".04em", color: T.muted, marginBottom: 6 }}>WHAT THE PD PROPOSED</div>
-      <div style={{ fontSize: 13 }}>{shortName(o.pdApprover || "")} · {o.pdGrantName || "no grant"} · FRS <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{o.pdFrs || "none"}</span></div>
+      <div style={{ fontSize: 13 }}>{shortName(o.pdApprover || "")} · {o.pdGrantName || "no grant"}</div>
       {o.fundNote && <div style={{ fontSize: 11.5, color: T.muted, marginTop: 3 }}>{o.fundNote}</div>}
     </div>
     {o.experiment && <div style={{ fontSize: 12.5, color: T.ink, marginBottom: 16, lineHeight: 1.45 }}><b>Reason:</b> {o.experiment}</div>}
@@ -1510,12 +1536,10 @@ function ChairSheet({ o, grants, orders, caps, onConfirm, onClose }) {
         {over ? " This purchase exceeds what's left." : ` After this, ${money(remaining - o.total)}.`}
       </div>
     )}
-    <Field label="FRS / account number *">
-      <Input value={frs} onChange={(e) => setFrs(e.target.value)} style={{ fontFamily: "ui-monospace, Menlo, monospace" }} />
-    </Field>
-    {changed && <div style={{ fontSize: 12, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "9px 11px", marginBottom: 14, lineHeight: 1.4 }}>You're changing the account the PD proposed. Both versions stay on the record.</div>}
+    <div style={{ fontSize: 11.5, color: T.muted, marginBottom: 14, lineHeight: 1.5 }}>No FRS needed — Megan adds it for this grant when she places the order.</div>
+    {changed && <div style={{ fontSize: 12, color: T.amber, background: "#FDF0DF", borderRadius: 10, padding: "9px 11px", marginBottom: 14, lineHeight: 1.4 }}>You're changing the grant the PD proposed. Both versions stay on the record.</div>}
     {onBehalf && <div style={{ fontSize: 12, color: T.muted, background: "#F6F8F9", border: `1px solid ${T.border}`, borderRadius: 10, padding: "9px 11px", marginBottom: 14, lineHeight: 1.4 }}>You're not the chair — this will be logged as given on his behalf, by you.</div>}
-    <Btn onClick={() => ok && onConfirm({ frs: frs.trim(), grantId })} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Approve and send to Megan</Btn>
+    <Btn onClick={() => ok && onConfirm({ grantId })} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Approve and send to Megan</Btn>
   </Sheet>);
 }
 
@@ -1575,20 +1599,22 @@ function SpendPanel({ orders, grants }) {
 }
 
 function GrantsPanel({ grants, onUpsert, onDel }) {
-  const [nm, setNm] = useState(""); const [bud, setBud] = useState("");
+  const [nm, setNm] = useState(""); const [bud, setBud] = useState(""); const [fr, setFr] = useState("");
   return (
     <div style={{ background: "#fff", border: `1px solid ${T.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
       <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 12 }}>Grants &amp; budgets</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
         {grants.map((g) => (<div key={g.id} style={{ ...rowFlat, gap: 8 }}>
           <div style={{ minWidth: 0, flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{g.name}</div></div>
-          <Input value={g.budget || ""} onChange={(e) => onUpsert({ ...g, budget: parseFloat(e.target.value) || 0 })} placeholder="budget $" inputMode="decimal" style={{ width: 110, height: 38 }} />
+          <Input value={g.frs || ""} onChange={(e) => onUpsert({ ...g, frs: e.target.value.trim() })} placeholder="FRS" style={{ width: 90, height: 38, fontFamily: "ui-monospace, Menlo, monospace" }} />
+          <Input value={g.budget || ""} onChange={(e) => onUpsert({ ...g, budget: parseFloat(e.target.value) || 0 })} placeholder="budget $" inputMode="decimal" style={{ width: 100, height: 38 }} />
           <button onClick={() => onDel(g.id)} style={iconBtn}><Trash2 size={15} color={T.muted} /></button>
         </div>))}
       </div>
       <Field label="Add grant / fund"><Input value={nm} onChange={(e) => setNm(e.target.value)} placeholder="e.g. R01HD114744" /></Field>
+      <Field label="FRS (optional — Megan can add it later)"><Input value={fr} onChange={(e) => setFr(e.target.value)} placeholder="e.g. 123456" style={{ fontFamily: "ui-monospace, Menlo, monospace" }} /></Field>
       <Field label="Budget ($, optional)"><Input value={bud} onChange={(e) => setBud(e.target.value)} inputMode="decimal" placeholder="0.00" /></Field>
-      <Btn onClick={() => { if (nm.trim()) { onUpsert({ id: uid(), name: nm.trim(), budget: parseFloat(bud) || 0, notes: "" }); setNm(""); setBud(""); } }} style={{ opacity: nm.trim() ? 1 : .5 }}>Add grant</Btn>
+      <Btn onClick={() => { if (nm.trim()) { onUpsert({ id: uid(), name: nm.trim(), budget: parseFloat(bud) || 0, notes: "", frs: fr.trim() }); setNm(""); setBud(""); setFr(""); } }} style={{ opacity: nm.trim() ? 1 : .5 }}>Add grant</Btn>
     </div>
   );
 }
