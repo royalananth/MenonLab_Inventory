@@ -1,11 +1,9 @@
 // app/api/order-form/route.js
-// GET /api/order-form?order_id=<id>  ->  downloads the filled UTMB Supply Order Form.
+// GET /api/order-form?order_id=<id>[&frs=<frs>]  ->  downloads the filled UTMB Supply Order Form.
 //
 // Permission: only a member whose role is "purchasing" (Megan) or who is an
-// access owner can generate it, and only once an FRS has been entered.
-//
-// Self-contained: resolves the session from the request token against the
-// sessions/members tables, and reads the order from the orders table directly.
+// access owner can generate it, and only once an FRS is available (either saved
+// on the order, or passed in the `frs` query param when Megan is placing it).
 
 import { NextResponse } from "next/server";
 import { q, ensureInit } from "../../../lib/db.js";
@@ -13,14 +11,14 @@ import { buildOrderFormBuffer, orderFormFilename } from "../../../lib/orderForm.
 
 export const dynamic = "force-dynamic";
 
-// Pull the session token from wherever the client sends it.
+// Match how the rest of the app authenticates (x-session), with fallbacks.
 function readToken(req) {
   const h = req.headers;
   const auth = h.get("authorization") || "";
   if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
   return (
+    h.get("x-session") ||
     h.get("x-token") ||
-    h.get("x-auth-token") ||
     new URL(req.url).searchParams.get("token") ||
     ""
   );
@@ -46,7 +44,9 @@ export async function GET(req) {
     return NextResponse.json({ error: "Only Megan can generate the UTMB form" }, { status: 403 });
   }
 
-  const orderId = new URL(req.url).searchParams.get("order_id");
+  const url = new URL(req.url);
+  const orderId = url.searchParams.get("order_id");
+  const frsOverride = (url.searchParams.get("frs") || "").trim();
   if (!orderId) return NextResponse.json({ error: "order_id required" }, { status: 400 });
 
   const { rows } = await q(
@@ -57,7 +57,9 @@ export async function GET(req) {
   );
   const o = rows[0];
   if (!o) return NextResponse.json({ error: "Order not found" }, { status: 404 });
-  if (!o.frs) {
+
+  const frs = frsOverride || o.frs || "";
+  if (!frs) {
     return NextResponse.json({ error: "Enter the FRS before generating the form" }, { status: 422 });
   }
 
@@ -66,7 +68,7 @@ export async function GET(req) {
     date: new Date(d).toISOString().slice(0, 10),
     requestId: `ORD-${o.id}`,
     vendor: o.vendor || "",
-    frs: o.frs || "",
+    frs,
     project: o.grant_name || o.project || "",
     requestor: o.requester || "",
     lcode: "",                 // no LCode column in the schema; left blank
