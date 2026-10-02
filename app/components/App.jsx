@@ -1104,7 +1104,31 @@ function pendingFor(orders, me, caps) {
   return orders.filter((o) => awaitingMe(o, me, caps)).length;
 }
 const committedFor = (orders, gid) => orders.filter((o) => o.grantId === gid && (o.status === "ordered" || o.status === "received")).reduce((s, o) => s + (Number(o.total) || 0), 0);
-
+/* Generate the UTMB Supply Order Form for an order and download it. Uses the FRS
+   passed in (what Megan just typed) or the one already saved on the order. */
+async function downloadUtmbForm(order, frsOverride) {
+  let tok = "";
+  try { tok = localStorage.getItem("mlab_token") || ""; } catch {}
+  const qs = new URLSearchParams({ order_id: order.id });
+  if (frsOverride) qs.set("frs", frsOverride);
+  try {
+    const res = await fetch("/api/order-form?" + qs.toString(), { headers: { "x-session": tok } });
+    if (!res.ok) {
+      let msg = "Could not generate the UTMB form";
+      try { msg = (await res.json()).error || msg; } catch {}
+      alert(msg);
+      return;
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const name = (/filename="([^"]+)"/.exec(cd) || [])[1] || "UTMB_Order.xlsx";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch { alert("Can't reach the server to generate the form"); }
+}
 function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, projects, inv, members, approverNames, mediaPar, orderSeed, clearSeed, onCreate, onUpdate, onAction, onDelete, onUpsertGrant, onDelGrant }) {
   const [nw, setNw] = useState(false);
   useEffect(() => { if (orderSeed) setNw(true); }, [orderSeed]);
@@ -1279,6 +1303,7 @@ function OrderCard({ o, me, caps, grants, orders, inv, events, chairLimit, onAct
           <ActBtn kind="ghost" onClick={reject} icon={X}>Send back</ActBtn></>}
         {o.status === "approved" && caps.place && <ActBtn onClick={place} icon={ShoppingCart}>Mark placed on UTMB</ActBtn>}
         {o.status === "ordered" && caps.place && <ActBtn onClick={onReceive} icon={PackageCheck}>Mark received</ActBtn>}
+                       {caps.place && o.frs && (o.status === "ordered" || o.status === "received") && <ActBtn kind="ghost" onClick={() => downloadUtmbForm(o)} icon={FileSpreadsheet}>UTMB form</ActBtn>}
         {o.requester === me && atPd && <ActBtn kind="ghost" onClick={onEdit} icon={Pencil}>Edit</ActBtn>}
         {((o.requester === me && (atPd || o.status === "rejected")) || (caps.place && o.status !== "received")) && <ActBtn kind="ghost" onClick={() => { if (window.confirm("Cancel and delete this order request?")) onDelete(o.id); }} icon={Trash2}>{o.requester === me ? "Delete" : "Cancel"}</ActBtn>}
         {(events || []).length > 0 && <ActBtn kind="ghost" onClick={() => setTrail((v) => !v)} icon={ClipboardCheck}>{trail ? "Hide history" : `History (${events.length})`}</ActBtn>}
@@ -1325,6 +1350,7 @@ function PlaceSheet({ o, grant, onConfirm, onClose }) {
     <Field label="PO / order reference (optional)">
       <Input value={po} onChange={(e) => setPo(e.target.value)} placeholder="from the UTMB site" />
     </Field>
+    <Btn kind="ghost" onClick={() => downloadUtmbForm(o, frs.trim())} style={{ opacity: ok ? 1 : .5, marginBottom: 10 }}><FileSpreadsheet size={16} />Generate UTMB form</Btn>
     <Btn onClick={() => ok && onConfirm({ frs: frs.trim(), po: po.trim() })} style={{ opacity: ok ? 1 : .5 }}><CheckCircle2 size={16} />Mark placed</Btn>
     {!ok && <div style={{ fontSize: 11.5, color: T.muted, textAlign: "center", marginTop: 8 }}>Add the FRS to place the order.</div>}
   </Sheet>);
