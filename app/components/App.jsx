@@ -1144,7 +1144,7 @@ function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, p
   const toAct = orders.filter((o) => awaitingMe(o, me, caps));
   const anyRole = caps.approve || caps.place || caps.grants || caps.chairBackup;
   const inChain = orders.filter((o) => ["requested", "routed", "pd_ok", "approved", "ordered"].includes(o.status));
-  const shown = view === "mine" ? mine : view === "all" ? orders : view === "queue" ? inChain : toAct;
+  const shown = view === "mine" ? mine : view === "all" ? orders : view === "queue" ? inChain : (toAct.length ? toAct : mine);
 
   const exportToOrder = () => {
     const rows = orders.filter((o) => o.status === "approved").map((o) => ({ Item: o.itemName, "Cat#": o.catalog, Vendor: o.vendor, Qty: o.qty, "Unit $": o.unitPrice, "Total $": o.total, Project: o.project, Grant: o.grantName, Requester: o.requester, "Approved by": o.piApprover, Reason: o.experiment }));
@@ -1198,7 +1198,7 @@ function OrdersTab({ me, caps, token, orders, orderEvents, chairLimit, grants, p
         </div>
       )}
 
-      {anyRole && <div style={{ display: "flex", gap: 7, marginBottom: 12, flexWrap: "wrap" }}>
+      {me && <div style={{ display: "flex", gap: 7, marginBottom: 12, flexWrap: "wrap" }}>
         {[["act", "Needs you", toAct.length], ["mine", "Mine", mine.length], ["queue", "In the chain", inChain.length], ["all", "All", orders.length]].map(([k, label, n]) => (
           <button key={k} onClick={() => setView(k)} style={{ flex: 1, border: `1px solid ${view === k ? T.accent : T.border}`, background: view === k ? T.accent : "#fff", color: view === k ? "#fff" : T.ink, borderRadius: 10, padding: "8px 6px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{label}{n > 0 ? ` · ${n}` : ""}</button>
         ))}
