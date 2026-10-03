@@ -171,7 +171,8 @@ export async function POST(req) {
   try {
     if (type === "item") {
       if (action === "upsert") {
-        if (!c.edit) return deny("Only program directors and full-access staff can edit inventory.");
+        // Lab members and full-access staff can add or edit inventory; outside collaborators cannot.
+        if (me.role === "guest") return deny("Outside collaborators can only book instruments.");
         const i = payload;
         await q(`INSERT INTO items (id,name,category,scope,project,leader,room,fridge,box,catalog,vendor,qty,unit,notes,
                    lot_no,assay_group,host_species,clonality,clone_no,isotype,reactivity,applications,owner,received_date,min_qty,aliquots)
@@ -183,7 +184,8 @@ export async function POST(req) {
             i.lot || "", i.assayGroup || "", i.host || "", i.clonality || "", i.clone || "", i.isotype || "",
             i.reactivity || "", i.applications || "", i.owner || "", i.received || "", (i.minQty ?? "") + "", (i.aliquots ?? "") + ""]);
       } else if (action === "delete") {
-        if (!c.edit) return deny("Only program directors and full-access staff can delete inventory items.");
+        // Lab members and full-access staff can delete inventory; outside collaborators cannot.
+        if (me.role === "guest") return deny("Outside collaborators can only book instruments.");
         await q(`DELETE FROM items WHERE id=$1`, [payload.id]);
       } else if (action === "bulkPar") {
         // Low-stock alerts can only fire on items that have a par level. Setting
